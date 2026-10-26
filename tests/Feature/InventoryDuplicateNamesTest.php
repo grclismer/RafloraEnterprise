@@ -54,6 +54,74 @@ class InventoryDuplicateNamesTest extends TestCase
         $this->assertNull(InventoryItem::catalogMatches('Pink Rose', $this->pinkRose->id)['exact']);
     }
 
+    public function test_known_material_variants_match_the_canonical_catalog_item(): void
+    {
+        $foam = $this->item('Floral Foam', 0, 'blocks');
+        $this->item('Floral Foam - Brick', 0, 'pcs');
+        $this->item('Floral Foam (Oasis)', 0, 'piece');
+        $whiteRose = $this->item('White Rose', 0);
+        $this->item('White Rose Centerpiece', 0, 'piece');
+
+        $this->assertSame($foam->id, InventoryItem::catalogMatches('4 Floral Foam Blocks')['exact']?->id);
+        $this->assertSame($foam->id, InventoryItem::catalogMatches('Floral Foam Bricks')['exact']?->id);
+        $this->assertSame($foam->id, InventoryItem::catalogMatches('Floral Foam Oasis')['exact']?->id);
+        $this->assertSame($whiteRose->id, InventoryItem::catalogMatches('20 White Roses')['exact']?->id);
+        $this->assertSame($whiteRose->id, InventoryItem::catalogMatches('White Rose Centerpiece')['exact']?->id);
+        $this->assertNull(InventoryItem::catalogMatches('Floral Foam Brick', unit: 'pcs')['exact']);
+        $this->assertSame($foam->id, InventoryItem::catalogMatches('Floral Foam Brick', unit: 'pcs')['similar']?->id);
+        $this->assertNull(InventoryItem::catalogMatches('White Rose Centerpiece', unit: 'piece')['exact']);
+
+        $sphere = $this->item('Floral Foam Sphere', 0);
+        $this->assertSame($sphere->id, InventoryItem::catalogMatches('Floral Foam Sphere')['exact']?->id);
+        $this->assertNull(InventoryItem::catalogMatches('Foam Vase')['exact']);
+    }
+
+    public function test_catalog_similarity_candidates_flag_spelling_and_word_order_variants(): void
+    {
+        $orchid = $this->item('White Phalaenopsis Orchid', 0);
+        $this->item('Red Rose', 0);
+
+        $this->assertSame(
+            [$orchid->id],
+            InventoryItem::catalogSimilarityCandidates('White Phalaenopsis Orchd')->pluck('id')->all()
+        );
+        $this->assertSame(
+            [$orchid->id],
+            InventoryItem::catalogSimilarityCandidates('Orchid White Phalaenopsis')->pluck('id')->all()
+        );
+    }
+
+    public function test_promote_requires_review_before_creating_a_possible_spelling_duplicate(): void
+    {
+        $existing = $this->item('White Phalaenopsis Orchid', 0);
+        $line = $this->unmatchedLine('White Phalaenopsis Orchd');
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.bookings.ai.promote', $this->booking), [
+                'booking_item_id' => $line->id,
+                'catalog_name' => 'White Phalaenopsis Orchd',
+                'category' => 'Flowers',
+            ])
+            ->assertSessionHas('error', 'Possible catalog matches: White Phalaenopsis Orchid. Review these items, link the correct one, or confirm that the new item is genuinely different.');
+
+        $this->assertNull($line->fresh()->inventory_item_id);
+        $this->assertSame(2, InventoryItem::withTrashed()->count());
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.bookings.ai.promote', $this->booking), [
+                'booking_item_id' => $line->id,
+                'catalog_name' => 'White Phalaenopsis Orchd',
+                'category' => 'Flowers',
+                'confirm_distinct_catalog_item' => '1',
+            ])
+            ->assertSessionHas('success');
+
+        $this->assertNotNull($line->fresh()->inventory_item_id);
+        $this->assertSame(3, InventoryItem::withTrashed()->count());
+        $this->assertSame('White Phalaenopsis Orchd', $line->fresh()->inventoryItem->name);
+        $this->assertDatabaseHas('inventory_items', ['id' => $existing->id, 'name' => 'White Phalaenopsis Orchid']);
+    }
+
     public function test_promote_to_catalog_links_to_the_existing_item_instead_of_adding_a_duplicate(): void
     {
         $line = $this->unmatchedLine('pink rose');
@@ -64,6 +132,68 @@ class InventoryDuplicateNamesTest extends TestCase
 
         $this->assertSame($this->pinkRose->id, (int) $line->fresh()->inventory_item_id);
         $this->assertSame(1, InventoryItem::withTrashed()->count());
+    }
+
+    public function test_semantic_variant_with_a_different_unit_requires_manual_link_instead_of_promotion(): void
+    {
+        $foam = $this->item('Floral Foam', 94, 'blocks');
+        $line = $this->unmatchedLine('Floral Foam - Brick');
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.bookings.ai.promote', $this->booking), [
+                'booking_item_id' => $line->id,
+                'catalog_name' => 'Floral Foam Brick',
+                'unit' => 'pcs',
+            ])
+            ->assertSessionHas('error', 'An inventory item named "Floral Foam" already exists. Link the material to it instead of adding a duplicate.');
+
+        $this->assertNull($line->fresh()->inventory_item_id);
+        $this->assertSame(2, InventoryItem::withTrashed()->count());
+    }
+
+    public function test_add_missing_ai_items_does_not_promote_a_unit_conflict_as_a_new_inventory_item(): void
+    {
+        $whiteRose = $this->item('White Rose', 1180, 'stems');
+        $line = $this->unmatchedLine('20 White Roses');
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.notifications.promote-booking-items', $this->booking), ['booking_item_ids' => [$line->id]])
+            ->assertSessionHas('error', 'Not added: "20 White Roses" (similar to "White Rose": link it from the booking).');
+
+        $this->assertNull($line->fresh()->inventory_item_id);
+        $this->assertSame($whiteRose->id, InventoryItem::where('name', 'White Rose')->value('id'));
+        $this->assertSame(2, InventoryItem::withTrashed()->count());
+    }
+
+    public function test_notification_bulk_add_skips_possible_spelling_duplicates_for_manual_review(): void
+    {
+        $existing = $this->item('White Phalaenopsis Orchid', 0);
+        $line = $this->unmatchedLine('White Phalaenopsis Orchd');
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.notifications.promote-booking-items', $this->booking), ['booking_item_ids' => [$line->id]])
+            ->assertSessionHas('error', 'Not added: "White Phalaenopsis Orchd" (possible duplicate of: White Phalaenopsis Orchid; review and link it from the booking).');
+
+        $this->assertNull($line->fresh()->inventory_item_id);
+        $this->assertSame($existing->id, InventoryItem::where('name', 'White Phalaenopsis Orchid')->value('id'));
+        $this->assertSame(2, InventoryItem::withTrashed()->count());
+    }
+
+    public function test_link_existing_allows_admin_to_select_the_canonical_item_explicitly(): void
+    {
+        $foam = $this->item('Floral Foam', 94, 'blocks');
+        $line = $this->unmatchedLine('Floral Foam - Brick');
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.bookings.ai.link', $this->booking), [
+                'booking_item_id' => $line->id,
+                'link_inventory_item_id' => $foam->id,
+            ])
+            ->assertSessionHas('success', 'AI suggestion linked to master inventory.');
+
+        $this->assertSame($foam->id, (int) $line->fresh()->inventory_item_id);
+        $this->assertSame('Floral Foam', $line->fresh()->item_name);
+        $this->assertSame(2, InventoryItem::withTrashed()->count());
     }
 
     public function test_promote_refuses_a_plural_or_archived_twin(): void
@@ -145,6 +275,29 @@ class InventoryDuplicateNamesTest extends TestCase
         $this->assertSame(99.0, (float) $vase->fresh()->unit_cost);
     }
 
+    public function test_manual_inventory_add_requires_explicit_review_for_a_spelling_variant(): void
+    {
+        $existing = $this->item('White Phalaenopsis Orchid', 0);
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.inventory.store'), $this->itemForm('White Phalaenopsis Orchd'))
+            ->assertSessionHasErrors([
+                'name' => 'Possible catalog matches: White Phalaenopsis Orchid. Review these items, then confirm below only if this is a genuinely different item.',
+            ]);
+
+        $this->assertSame(2, InventoryItem::withTrashed()->count());
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.inventory.store'), array_merge(
+                $this->itemForm('White Phalaenopsis Orchd'),
+                ['confirm_distinct_catalog_item' => '1']
+            ))
+            ->assertSessionHas('success');
+
+        $this->assertSame(3, InventoryItem::withTrashed()->count());
+        $this->assertDatabaseHas('inventory_items', ['id' => $existing->id, 'name' => 'White Phalaenopsis Orchid']);
+    }
+
     public function test_csv_import_updates_the_same_name_and_stops_on_a_near_duplicate(): void
     {
         $this->import("name,category,is_perishable,current_stock,unit_cost,min_stock,unit\npink rose,Fresh Flowers,1,520,12.50,20,stems\n")
@@ -192,8 +345,8 @@ class InventoryDuplicateNamesTest extends TestCase
         ]);
     }
 
-    private function item(string $name, float $stock): InventoryItem
+    private function item(string $name, float $stock, string $unit = 'stems'): InventoryItem
     {
-        return InventoryItem::create(['name' => $name, 'category' => 'Flowers', 'is_perishable' => true, 'current_stock' => $stock, 'unit_cost' => 10, 'min_stock' => 0, 'unit' => 'stems']);
+        return InventoryItem::create(['name' => $name, 'category' => 'Flowers', 'is_perishable' => true, 'current_stock' => $stock, 'unit_cost' => 10, 'min_stock' => 0, 'unit' => $unit]);
     }
 }

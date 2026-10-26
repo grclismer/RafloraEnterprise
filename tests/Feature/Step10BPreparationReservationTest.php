@@ -27,6 +27,19 @@ class Step10BPreparationReservationTest extends TestCase
         ]);
     }
 
+    private function createVerifiedPayment(Booking $booking): Payment
+    {
+        return Payment::create([
+            'booking_id' => $booking->id,
+            'payment_type' => 'bank_transfer',
+            'payment_option' => 'downpayment',
+            'status' => 'downpayment_received',
+            'amount' => 500,
+            'reference_number' => 'VERIFIED-' . uniqid(),
+            'verified_at' => now(),
+        ]);
+    }
+
     private function createStaff(): User
     {
         return User::create([
@@ -121,7 +134,7 @@ class Step10BPreparationReservationTest extends TestCase
         $this->assertSame(0.0, (float) $item->fresh()->reserved_stock);
     }
 
-    public function test_confirmed_booking_with_future_preparation_start_date_does_not_reserve(): void
+    public function test_confirmed_booking_with_future_preparation_start_date_reserves_on_payment_verification(): void
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['preparation_start_date' => now()->addDays(5)->toDateString(), 'status' => 'payment_submitted']);
@@ -146,7 +159,8 @@ class Step10BPreparationReservationTest extends TestCase
         $this->assertEquals('confirmed', $booking->status);
         $this->assertEquals('scheduled', $booking->preparation_status);
         
-        $this->assertSame(0, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
+        $this->assertSame(1, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
+        $this->assertSame(2.0, (float) $item->fresh()->reserved_stock);
     }
 
     public function test_confirmed_booking_with_today_preparation_start_date_reserves_inventory_on_verify(): void
@@ -181,6 +195,7 @@ class Step10BPreparationReservationTest extends TestCase
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['preparation_start_date' => null, 'status' => 'confirmed']);
+        $this->createVerifiedPayment($booking);
         $item = $this->createInventoryItem('Vase', 'props', false, 10);
         $booking->bookingItems()->create([
             'inventory_item_id' => $item->id,
@@ -195,28 +210,11 @@ class Step10BPreparationReservationTest extends TestCase
         $this->assertSame(0, InventoryTransaction::where('booking_id', $booking->id)->count());
     }
 
-    public function test_admin_reserve_materials_fails_if_preparation_start_date_is_future(): void
+    public function test_admin_can_reserve_materials_before_the_future_preparation_start_date(): void
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['preparation_start_date' => now()->addDays(5)->toDateString(), 'status' => 'confirmed']);
-        $item = $this->createInventoryItem('Vase', 'props', false, 10);
-        $booking->bookingItems()->create([
-            'inventory_item_id' => $item->id,
-            'item_name' => $item->name,
-            'quantity' => 2,
-            'quoted_unit_price' => 100,
-            'confirmed_at' => now(),
-        ]);
-
-        $response = $this->actingAs($admin)->post(route('admin.bookings.reserve-materials', $booking));
-        $response->assertSessionHas('error');
-        $this->assertSame(0, InventoryTransaction::where('booking_id', $booking->id)->count());
-    }
-
-    public function test_admin_reserve_materials_succeeds_if_preparation_start_date_is_today(): void
-    {
-        $admin = $this->createAdmin();
-        $booking = $this->createBooking(['preparation_start_date' => now()->toDateString(), 'status' => 'confirmed']);
+        $this->createVerifiedPayment($booking);
         $item = $this->createInventoryItem('Vase', 'props', false, 10);
         $booking->bookingItems()->create([
             'inventory_item_id' => $item->id,
@@ -228,6 +226,47 @@ class Step10BPreparationReservationTest extends TestCase
 
         $response = $this->actingAs($admin)->post(route('admin.bookings.reserve-materials', $booking));
         $response->assertSessionHas('success');
+        $this->assertSame(1, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
+        $this->assertSame(2.0, (float) $item->fresh()->reserved_stock);
+    }
+
+    public function test_admin_reserve_materials_succeeds_if_preparation_start_date_is_today(): void
+    {
+        $admin = $this->createAdmin();
+        $booking = $this->createBooking(['preparation_start_date' => now()->toDateString(), 'status' => 'confirmed']);
+        $this->createVerifiedPayment($booking);
+        $item = $this->createInventoryItem('Vase', 'props', false, 10);
+        $booking->bookingItems()->create([
+            'inventory_item_id' => $item->id,
+            'item_name' => $item->name,
+            'quantity' => 2,
+            'quoted_unit_price' => 100,
+            'confirmed_at' => now(),
+        ]);
+
+        $response = $this->actingAs($admin)->post(route('admin.bookings.reserve-materials', $booking));
+        $response->assertSessionHas('success');
+        $this->assertSame(1, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
+        $this->assertSame('in_preparation', $booking->fresh()->preparation_status);
+    }
+
+    public function test_admin_can_reserve_materials_after_the_valid_preparation_date_has_arrived(): void
+    {
+        $admin = $this->createAdmin();
+        $booking = $this->createBooking(['preparation_start_date' => now()->subDay()->toDateString(), 'status' => 'confirmed']);
+        $this->createVerifiedPayment($booking);
+        $item = $this->createInventoryItem('Vase', 'props', false, 10);
+        $booking->bookingItems()->create([
+            'inventory_item_id' => $item->id,
+            'item_name' => $item->name,
+            'quantity' => 2,
+            'quoted_unit_price' => 100,
+            'confirmed_at' => now(),
+        ]);
+
+        $this->actingAs($admin)->post(route('admin.bookings.reserve-materials', $booking))
+            ->assertSessionHas('success');
+
         $this->assertSame(1, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
         $this->assertSame('in_preparation', $booking->fresh()->preparation_status);
     }

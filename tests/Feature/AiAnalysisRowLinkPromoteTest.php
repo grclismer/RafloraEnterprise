@@ -89,6 +89,45 @@ class AiAnalysisRowLinkPromoteTest extends TestCase
         $this->assertNull($line->confirmed_at);
     }
 
+    public function test_linking_a_variant_hides_the_unmatched_analysis_row_and_combines_linked_quantities(): void
+    {
+        $analysis = $this->booking->aiAnalyses()->firstOrFail();
+        $analysis->update(['suggested_materials' => [
+            ['item_name' => 'Pink Roses', 'quantity' => 40, 'estimated_unit_cost_php' => 90],
+        ]]);
+
+        $existingLine = BookingItem::create([
+            'booking_id' => $this->booking->id,
+            'inventory_item_id' => $this->pinkRose->id,
+            'item_name' => $this->pinkRose->name,
+            'quantity' => 40,
+            'quoted_unit_price' => 80,
+            'is_ai_suggested' => true,
+            'procurement_status' => 'pending',
+        ]);
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.bookings.ai.link', $this->booking), [
+                'ai_item_name' => 'Pink Roses',
+                'quantity' => 40,
+                'unit_price' => 80,
+                'link_inventory_item_id' => $this->pinkRose->id,
+            ])
+            ->assertSessionHas('success');
+
+        $html = $this->actingAs($this->admin)
+            ->get(route('admin.bookings.show', $this->booking))
+            ->assertOk()
+            ->getContent();
+
+        $this->assertStringContainsString('Combined 2 lines', $html);
+        $this->assertMatchesRegularExpression('/id="input_qty_0"[^>]*name="items\[0\]\[quantity\]"[^>]*value="80"/', $html);
+        $this->assertStringNotContainsString('Unmatched / AI Suggestion', $html);
+        $this->assertSame(2, BookingItem::where('booking_id', $this->booking->id)->count());
+        $this->assertSame(80.0, (float) BookingItem::where('booking_id', $this->booking->id)->sum('quantity'));
+        $this->assertSame($this->pinkRose->id, (int) $existingLine->fresh()->inventory_item_id);
+    }
+
     public function test_promote_on_an_analysis_row_with_an_existing_name_links_instead_of_duplicating(): void
     {
         $this->actingAs($this->admin)

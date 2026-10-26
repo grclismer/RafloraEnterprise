@@ -82,6 +82,35 @@ class StaffWorkspaceService
             ->values();
     }
 
+    public function canDispatch(Booking $booking): bool
+    {
+        return $booking->confirmed_at !== null
+            && $booking->hasVerifiedPayment()
+            && $booking->hasValidPreparationSchedule()
+            && !in_array($booking->status, self::DISPATCH_CLOSED_STATUSES, true);
+    }
+
+    public function dispatchLockMessage(Booking $booking): ?string
+    {
+        if (!$booking->hasVerifiedPayment()) {
+            return 'Dispatch is locked until a down payment or full payment is verified.';
+        }
+
+        if (!$booking->hasValidPreparationSchedule()) {
+            return 'Dispatch is locked until Admin schedules a valid preparation start date.';
+        }
+
+        if ($booking->confirmed_at === null) {
+            return 'Dispatch is locked until the booking has a confirmation date.';
+        }
+
+        if (in_array($booking->status, self::DISPATCH_CLOSED_STATUSES, true)) {
+            return 'Dispatch is unavailable because this booking is closed or in its return phase.';
+        }
+
+        return null;
+    }
+
     /** Creates the default checklist for an assigned event (idempotent: unique booking_id + key). */
     public function ensureChecklist(Booking $booking): void
     {
@@ -131,6 +160,15 @@ class StaffWorkspaceService
      */
     public function dispatchRows(Booking $booking): Collection
     {
+        $reusableInventoryIds = $booking->bookingItems
+            ->filter(fn ($bookingItem) => $bookingItem->confirmed_at !== null
+                && (float) $bookingItem->quantity > 0
+                && $bookingItem->inventory_item_id
+                && !$bookingItem->requiresFreshProcurement())
+            ->pluck('inventory_item_id')
+            ->map(fn ($id) => (int) $id)
+            ->unique();
+
         return $booking->inventoryTransactions
             ->filter(fn ($tx) => $tx->inventoryItem !== null)
             ->groupBy('inventory_item_id')
@@ -147,7 +185,8 @@ class StaffWorkspaceService
                     'outstanding' => max(0.0, round($reserved - $dispatched, 4)),
                 ];
             })
-            ->filter(fn ($row) => $row['reserved'] > 0 || $row['dispatched'] > 0)
+            ->filter(fn ($row) => $reusableInventoryIds->contains((int) $row['item']->id)
+                && ($row['reserved'] > 0 || $row['dispatched'] > 0))
             ->values();
     }
 
@@ -165,7 +204,7 @@ class StaffWorkspaceService
                 $item = $bi->inventoryItem;
                 $required = (float) $bi->quantity;
 
-                if ($item->is_perishable) {
+                if ($bi->requiresFreshProcurement()) {
                     [$state, $label] = match ($bi->procurement_status) {
                         'ready' => ['ready', 'Ready'],
                         'confirmed' => ['preparing', 'Ordered'],
@@ -189,7 +228,7 @@ class StaffWorkspaceService
                     'name' => $bi->item_name ?? $item->name,
                     'quantity' => $required,
                     'unit' => $item->unit,
-                    'perishable' => (bool) $item->is_perishable,
+                    'perishable' => $bi->requiresFreshProcurement(),
                     'state' => $state,
                     'label' => $label,
                 ];
@@ -232,6 +271,7 @@ class StaffWorkspaceService
             if ($rows->isNotEmpty() && !($dispatchClosed && $outstanding->isNotEmpty())) {
                 $fullyDispatched = $outstanding->isEmpty();
                 $partly = !$fullyDispatched && $rows->contains(fn ($row) => $row['dispatched'] > 0);
+                $dispatchLockMessage = $this->dispatchLockMessage($booking);
                 $tasks->push($this->task([
                     'key' => 'dispatch-' . $booking->id,
                     'type' => 'dispatch',
@@ -242,8 +282,9 @@ class StaffWorkspaceService
                     'completed_at' => null,
                     'detail' => $fullyDispatched
                         ? 'All reserved materials dispatched'
-                        : ($rows->count() - $outstanding->count()) . ' of ' . $rows->count() . ' materials dispatched'
-                            . (is_null($booking->confirmed_at) ? ' · waiting for booking confirmation date' : ''),
+                        : ($dispatchLockMessage
+                            ? $dispatchLockMessage
+                            : ($rows->count() - $outstanding->count()) . ' of ' . $rows->count() . ' materials dispatched'),
                     'url' => $eventUrl . '#dispatch',
                 ], $now));
             }

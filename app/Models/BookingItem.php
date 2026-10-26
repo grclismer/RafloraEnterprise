@@ -19,6 +19,7 @@ class BookingItem extends Model
         'is_ai_suggested',
         'confirmed_at',
         'procurement_status',
+        'fresh_procurement_override',
         'suggested_order_date',
         'suggested_delivery_date',
         'notes',
@@ -29,6 +30,7 @@ class BookingItem extends Model
         'quoted_unit_price' => 'decimal:2',
         'ai_recommended_price' => 'decimal:2',
         'is_ai_suggested' => 'boolean',
+        'fresh_procurement_override' => 'boolean',
         'confirmed_at' => 'datetime',
     ];
 
@@ -40,5 +42,10 @@ class BookingItem extends Model
     public function inventoryItem(): BelongsTo
     {
         return $this->belongsTo(InventoryItem::class, 'inventory_item_id', 'id');
+    }
+
+    public function requiresFreshProcurement(): bool
+    {
+        return $this->fresh_procurement_override ?? (bool) $this->inventoryItem?->is_perishable;
     }
 }

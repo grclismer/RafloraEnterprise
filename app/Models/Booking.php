@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use Illuminate\Support\Carbon;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
@@ -59,6 +60,15 @@ class Booking extends Model
                     'entity_type' => Booking::class,
                     'entity_id' => $booking->id,
                 ]);
+
+                // Registered clients hear about every status change in the portal and by email.
+                // Guests are covered by GuestBookingNotificationMail below.
+                if (! is_null($booking->client_id)) {
+                    $changedAt = now();
+                    DB::afterCommit(function () use ($booking, $changedAt): void {
+                        \App\Services\ClientStatusNotifier::statusChanged($booking->fresh() ?? $booking, $changedAt);
+                    });
+                }
             }
 
             if ($quoteChanged) {
@@ -203,8 +213,11 @@ class Booking extends Model
     public function areFreshFlowersReady(): bool
     {
         $perishableItems = $this->bookingItems()
-            ->whereHas('inventoryItem', fn ($q) => $q->where('is_perishable', true))
-            ->get();
+            ->with('inventoryItem')
+            ->whereNotNull('confirmed_at')
+            ->where('quantity', '>', 0)
+            ->get()
+            ->filter(fn (BookingItem $item) => $item->requiresFreshProcurement());
 
         if ($perishableItems->isEmpty()) {
             return true;
@@ -230,20 +243,94 @@ class Booking extends Model
     public function hasReusableMaterials(): bool
     {
         return $this->bookingItems()
+            ->with('inventoryItem')
             ->whereNotNull('confirmed_at')
-            ->whereHas('inventoryItem', fn ($q) => $q->where('is_perishable', false))
             ->where('quantity', '>', 0)
-            ->exists();
+            ->get()
+            ->contains(fn (BookingItem $item) => $item->inventory_item_id && !$item->requiresFreshProcurement());
+    }
+
+    public function freshProcurementItems()
+    {
+        return $this->bookingItems()
+            ->with('inventoryItem')
+            ->whereNotNull('confirmed_at')
+            ->where('quantity', '>', 0)
+            ->get()
+            ->filter(fn (BookingItem $item) => $item->requiresFreshProcurement())
+            ->values();
+    }
+
+    public function reusableBookingItems()
+    {
+        return $this->bookingItems()
+            ->with('inventoryItem')
+            ->whereNotNull('confirmed_at')
+            ->where('quantity', '>', 0)
+            ->get()
+            ->filter(fn (BookingItem $item) => $item->inventory_item_id && !$item->requiresFreshProcurement())
+            ->values();
     }
 
     public function hasDispatchedReusableMaterials(): bool
     {
+        $reusableInventoryIds = $this->bookingItems()
+            ->with('inventoryItem')
+            ->get()
+            ->filter(fn (BookingItem $item) => $item->inventory_item_id && !$item->requiresFreshProcurement())
+            ->pluck('inventory_item_id')
+            ->map(fn ($id) => (int) $id)
+            ->unique();
+
+        if ($reusableInventoryIds->isEmpty()) {
+            return false;
+        }
+
         $netDispatch = \App\Models\InventoryTransaction::where('booking_id', $this->id)
             ->whereIn('transaction_type', ['dispatch', 'dispatch_correction'])
-            ->whereHas('inventoryItem', fn ($q) => $q->where('is_perishable', false))
+            ->whereIn('inventory_item_id', $reusableInventoryIds)
             ->sum('quantity_change');
 
         return abs((float) $netDispatch) > 0.0;
+    }
+
+    public function hasVerifiedPayment(): bool
+    {
+        return $this->payments()->whereNotNull('verified_at')->exists();
+    }
+
+    public function isPreparationDateAllowed(?\DateTimeInterface $date = null, ?\DateTimeInterface $eventDate = null): bool
+    {
+        $date = $date ? Carbon::parse($date)->startOfDay() : $this->preparation_start_date?->copy()->startOfDay();
+
+        return $date
+            && $date->greaterThanOrEqualTo(Carbon::today())
+            && $this->isPreparationDateWithinEventWindow($date, $eventDate);
+    }
+
+    public function isPreparationDateWithinEventWindow(?\DateTimeInterface $date = null, ?\DateTimeInterface $eventDate = null): bool
+    {
+        $date = $date ? Carbon::parse($date)->startOfDay() : $this->preparation_start_date?->copy()->startOfDay();
+        $eventDate = $eventDate ? Carbon::parse($eventDate)->startOfDay() : $this->event_date?->copy()->startOfDay();
+
+        if (!$date || !$eventDate) {
+            return false;
+        }
+
+        return $date->lessThanOrEqualTo($eventDate->subDays(14));
+    }
+
+    public function hasPreparationStarted(): bool
+    {
+        return $this->preparation_start_date !== null
+            && $this->isPreparationDateWithinEventWindow()
+            && $this->preparation_start_date->lessThanOrEqualTo(Carbon::today());
+    }
+
+    public function hasValidPreparationSchedule(): bool
+    {
+        return $this->preparation_start_date !== null
+            && $this->isPreparationDateWithinEventWindow();
     }
 
     public function package(): BelongsTo

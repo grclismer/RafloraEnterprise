@@ -92,6 +92,19 @@ class Step10DOperationalWorkflowTest extends TestCase
         ]);
     }
 
+    private function createVerifiedPayment(Booking $booking): Payment
+    {
+        return Payment::create([
+            'booking_id' => $booking->id,
+            'payment_type' => 'bank_transfer',
+            'payment_option' => 'downpayment',
+            'status' => 'downpayment_received',
+            'amount' => 500,
+            'reference_number' => 'VERIFIED-' . uniqid(),
+            'verified_at' => now(),
+        ]);
+    }
+
     public function test_confirmed_booking_with_null_preparation_start_date_does_not_reserve(): void
     {
         $admin = $this->createAdmin();
@@ -122,7 +135,7 @@ class Step10DOperationalWorkflowTest extends TestCase
         $this->assertSame(0.0, (float) $item->fresh()->reserved_stock);
     }
 
-    public function test_confirmed_booking_with_future_preparation_start_date_does_not_reserve(): void
+    public function test_confirmed_booking_with_future_preparation_start_date_reserves_on_payment_verification(): void
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['preparation_start_date' => now()->addDays(5)->toDateString(), 'status' => 'payment_submitted']);
@@ -147,7 +160,8 @@ class Step10DOperationalWorkflowTest extends TestCase
         $this->assertEquals('confirmed', $booking->status);
         $this->assertEquals('scheduled', $booking->preparation_status);
         
-        $this->assertSame(0, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
+        $this->assertSame(1, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
+        $this->assertSame(2.0, (float) $item->fresh()->reserved_stock);
     }
 
     public function test_confirmed_booking_with_today_preparation_start_date_reserves_inventory_on_verify(): void
@@ -182,6 +196,7 @@ class Step10DOperationalWorkflowTest extends TestCase
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['preparation_start_date' => null, 'status' => 'confirmed']);
+        $this->createVerifiedPayment($booking);
         $item = $this->createInventoryItem('Vase', 'props', false, 10);
         $booking->bookingItems()->create([
             'inventory_item_id' => $item->id,
@@ -196,10 +211,11 @@ class Step10DOperationalWorkflowTest extends TestCase
         $this->assertSame(0, InventoryTransaction::where('booking_id', $booking->id)->count());
     }
 
-    public function test_admin_reserve_materials_fails_if_preparation_start_date_is_future(): void
+    public function test_admin_can_reserve_materials_before_the_future_preparation_start_date(): void
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['preparation_start_date' => now()->addDays(5)->toDateString(), 'status' => 'confirmed']);
+        $this->createVerifiedPayment($booking);
         $item = $this->createInventoryItem('Vase', 'props', false, 10);
         $booking->bookingItems()->create([
             'inventory_item_id' => $item->id,
@@ -210,14 +226,16 @@ class Step10DOperationalWorkflowTest extends TestCase
         ]);
 
         $response = $this->actingAs($admin)->post(route('admin.bookings.reserve-materials', $booking));
-        $response->assertSessionHas('error');
-        $this->assertSame(0, InventoryTransaction::where('booking_id', $booking->id)->count());
+        $response->assertSessionHas('success');
+        $this->assertSame(1, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
+        $this->assertSame(2.0, (float) $item->fresh()->reserved_stock);
     }
 
     public function test_admin_reserve_materials_succeeds_if_preparation_start_date_is_today(): void
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['preparation_start_date' => now()->toDateString(), 'status' => 'confirmed']);
+        $this->createVerifiedPayment($booking);
         $item = $this->createInventoryItem('Vase', 'props', false, 10);
         $booking->bookingItems()->create([
             'inventory_item_id' => $item->id,
@@ -237,6 +255,7 @@ class Step10DOperationalWorkflowTest extends TestCase
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['status' => 'confirmed', 'preparation_start_date' => null]);
+        $this->createVerifiedPayment($booking);
         
         $response = $this->actingAs($admin)->put(route('admin.bookings.update', $booking), [
             'status' => 'confirmed',
@@ -253,7 +272,8 @@ class Step10DOperationalWorkflowTest extends TestCase
     public function test_admin_can_confirm_fresh_flowers(): void
     {
         $admin = $this->createAdmin();
-        $booking = $this->createBooking(['status' => 'confirmed', 'preparation_start_date' => now()->toDateString()]);
+        $booking = $this->createBooking(['status' => 'confirmed', 'preparation_start_date' => now()->addDays(5)->toDateString()]);
+        $this->createVerifiedPayment($booking);
         
         $item = $this->createInventoryItem('Roses', 'flowers', true, 100);
         $booking->bookingItems()->create([
@@ -277,6 +297,7 @@ class Step10DOperationalWorkflowTest extends TestCase
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['status' => 'confirmed', 'preparation_start_date' => now()->toDateString()]);
+        $this->createVerifiedPayment($booking);
         
         $item = $this->createInventoryItem('Vase', 'props', false, 10);
         $booking->bookingItems()->create([
@@ -305,6 +326,7 @@ class Step10DOperationalWorkflowTest extends TestCase
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['status' => 'confirmed', 'preparation_start_date' => now()->toDateString()]);
+        $this->createVerifiedPayment($booking);
         
         $item = $this->createInventoryItem('Vase', 'props', false, 10);
         $booking->bookingItems()->create([
@@ -334,6 +356,7 @@ class Step10DOperationalWorkflowTest extends TestCase
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['status' => 'confirmed', 'preparation_start_date' => now()->toDateString()]);
+        $this->createVerifiedPayment($booking);
         
         $item = $this->createInventoryItem('Vase', 'props', false, 10);
         $booking->bookingItems()->create([

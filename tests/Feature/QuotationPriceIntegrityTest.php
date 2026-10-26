@@ -6,6 +6,7 @@ use App\Models\Booking;
 use App\Models\BookingItem;
 use App\Models\Client;
 use App\Models\ClientNotification;
+use App\Models\InventoryItem;
 use App\Models\Payment;
 use App\Models\Quotation;
 use App\Models\QuotationHistory;
@@ -110,6 +111,62 @@ class QuotationPriceIntegrityTest extends TestCase
         $this->assertEquals(19000.0, (float) $booking->final_quoted_price);
         $this->assertEquals(7000.0, (float) $booking->raw_materials_sum);
         $this->assertCount(2, $quotation->items_snapshot);
+    }
+
+    public function test_linked_duplicate_lines_are_one_quotation_row_without_losing_source_lines(): void
+    {
+        $booking = $this->booking();
+        $inventoryItem = InventoryItem::create([
+            'name' => 'Floral Foam',
+            'category' => 'Props',
+            'is_perishable' => false,
+            'current_stock' => 0,
+            'unit_cost' => 10,
+            'min_stock' => 0,
+            'unit' => 'blocks',
+        ]);
+        $first = $this->item($booking, 'Floral Foam', 30, 10, [
+            'inventory_item_id' => $inventoryItem->id,
+            'is_ai_suggested' => true,
+        ]);
+        $second = $this->item($booking, 'Floral Foam', 30, 12, [
+            'inventory_item_id' => $inventoryItem->id,
+            'is_ai_suggested' => true,
+        ]);
+
+        $groupedRow = $this->row($first, [
+            'inventory_item_id' => $inventoryItem->id,
+            'quantity' => 60,
+            'unit_price' => 11,
+            'source_booking_item_ids' => [$first->id, $second->id],
+        ]);
+
+        $this->actingAs($this->admin())
+            ->get(route('admin.bookings.show', $booking))
+            ->assertOk()
+            ->assertSee('Combined 2 lines')
+            ->assertDontSee('Listed twice');
+
+        $this->sendQuotation($booking, ['items' => [$groupedRow]])
+            ->assertSessionMissing('error');
+
+        $this->assertSame([30.0, 30.0], BookingItem::where('booking_id', $booking->id)
+            ->orderBy('id')->pluck('quantity')->map(fn ($quantity) => (float) $quantity)->all());
+
+        $quotation = $booking->fresh()->activeQuotation;
+        $this->assertCount(1, $quotation->items_snapshot);
+        $this->assertSame('Floral Foam', $quotation->items_snapshot[0]['item_name']);
+        $this->assertEquals(60.0, $quotation->items_snapshot[0]['quantity']);
+        $this->assertEquals(11.0, $quotation->items_snapshot[0]['quoted_unit_price']);
+        $this->assertEquals(660.0, $quotation->items_snapshot[0]['amount']);
+        $this->assertEquals(1980.0, $quotation->items_snapshot[0]['selling_amount']);
+
+        $this->assertSame(2, BookingItem::where('booking_id', $booking->id)->count());
+        $this->assertEquals(60.0, (float) BookingItem::where('booking_id', $booking->id)->sum('quantity'));
+        $this->assertEquals(10.0, (float) $first->fresh()->quoted_unit_price);
+        $this->assertEquals(12.0, (float) $second->fresh()->quoted_unit_price);
+        $this->assertEquals(60.0, (float) $booking->inventoryItems()
+            ->whereKey($inventoryItem->id)->sum('booking_items.quantity'));
     }
 
     // The editor posts its running total even when the Admin typed nothing; it never becomes the price.

@@ -19,6 +19,13 @@ class ClientNotification extends Model
         'is_read',
     ];
 
+    protected static function booted(): void
+    {
+        static::created(function (ClientNotification $notification): void {
+            \App\Services\ClientStatusNotifier::supersede($notification);
+        });
+    }
+
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);

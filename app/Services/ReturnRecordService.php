@@ -31,11 +31,49 @@ class ReturnRecordService
             ->map(fn ($id) => (int) $id)
             ->all();
 
+        $reusableIds = $booking->reusableBookingItems()
+            ->pluck('inventory_item_id')
+            ->map(fn ($id) => (int) $id)
+            ->unique();
+
+        $dispatchItemIds = InventoryTransaction::query()
+            ->where('booking_id', $booking->id)
+            ->whereIn('transaction_type', ['dispatch', 'dispatch_correction'])
+            ->pluck('inventory_item_id')
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->unique();
+
+        $dispatchableIds = $reusableIds
+            ->merge($dispatchItemIds)
+            ->unique();
+
         return InventoryTransaction::with('inventoryItem')
             ->where('booking_id', $booking->id)
             ->whereIn('transaction_type', ['dispatch', 'dispatch_correction'])
             ->get()
-            ->filter(fn ($tx) => $tx->inventoryItem && (!$tx->inventoryItem->is_perishable || in_array((int) $tx->inventory_item_id, $onReturn, true)))
+            ->filter(function ($tx) use ($dispatchableIds, $onReturn) {
+                if (!$tx->inventoryItem) {
+                    return false;
+                }
+
+                $itemId = (int) $tx->inventory_item_id;
+                $isDispatchable = $dispatchableIds->contains($itemId);
+                $isKnownReturnItem = in_array($itemId, $onReturn, true);
+
+                // Some historical or hand-created dispatches are not attached to a BookingItem record,
+                // but they still represent reusable inventory that should be audited.
+                if (!$isDispatchable && !$isKnownReturnItem) {
+                    return false;
+                }
+
+                // Items already on a return line stay editable even if they became perishable later.
+                if ($tx->inventoryItem->is_perishable && !$isKnownReturnItem) {
+                    return false;
+                }
+
+                return true;
+            })
             ->groupBy('inventory_item_id')
             ->map(fn ($txs) => abs((float) $txs->sum('quantity_change')))
             ->filter(fn ($qty) => $qty > 0)

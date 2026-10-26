@@ -270,6 +270,7 @@ class SystemDataExporter
                 'is_ai_suggested' => (bool) $bi->is_ai_suggested,
                 'confirmed_at' => $bi->confirmed_at?->toISOString(),
                 'procurement_status' => $bi->procurement_status,
+                'fresh_procurement_override' => $bi->fresh_procurement_override,
                 'suggested_order_date' => $bi->suggested_order_date,
                 'suggested_delivery_date' => $bi->suggested_delivery_date,
                 'notes' => $bi->notes,

@@ -3,9 +3,11 @@
 namespace Tests\Feature;
 
 use App\Models\Booking;
+use App\Models\BookingItem;
 use App\Models\Client;
 use App\Models\InventoryItem;
 use App\Models\InventoryTransaction;
+use App\Models\Payment;
 use App\Models\User;
 use App\Services\InventoryDispatchService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -37,10 +39,27 @@ class DispatchErrorMessagesTest extends TestCase
             'status' => 'downpayment_received',
             'confirmed_at' => now(),
             'event_type' => 'wedding',
-            'event_date' => now()->addDays(10)->toDateString(),
+            'event_date' => now()->addDays(30)->toDateString(),
+            'preparation_start_date' => now()->toDateString(),
             'venue' => 'Grand Hall',
         ]);
         $this->arch = InventoryItem::create(['name' => 'Entrance Floral Arch Arrangement', 'category' => 'Props', 'is_perishable' => false, 'current_stock' => 200, 'unit_cost' => 450, 'min_stock' => 0, 'unit' => 'pieces']);
+        BookingItem::create([
+            'booking_id' => $this->booking->id,
+            'inventory_item_id' => $this->arch->id,
+            'item_name' => $this->arch->name,
+            'quantity' => 240,
+            'confirmed_at' => now(),
+        ]);
+        Payment::create([
+            'booking_id' => $this->booking->id,
+            'amount' => 100,
+            'payment_type' => 'bank_transfer',
+            'payment_option' => 'downpayment',
+            'reference_number' => 'VERIFIED-' . uniqid(),
+            'status' => 'downpayment_received',
+            'verified_at' => now(),
+        ]);
         InventoryTransaction::create(['booking_id' => $this->booking->id, 'inventory_item_id' => $this->arch->id, 'transaction_type' => 'booking_lock', 'quantity_change' => -240]);
     }
 

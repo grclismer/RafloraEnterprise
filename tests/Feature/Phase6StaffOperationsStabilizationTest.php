@@ -175,6 +175,91 @@ class Phase6StaffOperationsStabilizationTest extends TestCase
         $this->assertDatabaseHas('admin_alerts', ['type' => 'physical_count_variance', 'booking_id' => $this->booking->id, 'inventory_item_id' => $this->arch->id]);
     }
 
+    public function test_staff_dispatch_ui_uses_booking_classification_and_allows_dispatch_before_planned_prep_date(): void
+    {
+        $this->arch->update(['is_perishable' => true]);
+        $booking = Booking::create([
+            'client_id' => $this->booking->client_id,
+            'staff_id' => $this->staff->id,
+            'event_type' => 'wedding',
+            'event_date' => now()->addDays(30)->toDateString(),
+            'preparation_start_date' => now()->subDay()->toDateString(),
+            'venue' => 'Future Event Hall',
+            'status' => 'confirmed',
+            'confirmed_at' => now(),
+        ]);
+        BookingItem::create([
+            'booking_id' => $booking->id,
+            'inventory_item_id' => $this->arch->id,
+            'item_name' => $this->arch->name,
+            'quantity' => 2,
+            'confirmed_at' => now(),
+            'fresh_procurement_override' => false,
+        ]);
+        Payment::create([
+            'booking_id' => $booking->id,
+            'amount' => 100,
+            'amount_paid' => 100,
+            'payment_type' => 'gcash',
+            'reference_number' => 'P6-VERIFIED',
+            'status' => 'downpayment_received',
+            'verified_at' => now(),
+        ]);
+        InventoryTransaction::create([
+            'inventory_item_id' => $this->arch->id,
+            'booking_id' => $booking->id,
+            'quantity_change' => -2,
+            'transaction_type' => 'booking_lock',
+            'reason' => 'Preparation reservation',
+            'performed_by' => $this->admin->id,
+        ]);
+
+        $workspace = app(\App\Services\StaffWorkspaceService::class);
+        $this->assertTrue($workspace->canDispatch($booking));
+        $this->assertFalse($workspace->materialLines($booking)->first()['perishable']);
+        $this->actingAs($this->staff)->get(route('staff.events.show', $booking))
+            ->assertOk()
+            ->assertSee('name="items[0][quantity]"', false);
+
+        $booking->update(['preparation_start_date' => now()->addDay()->toDateString()]);
+        $this->assertTrue($workspace->canDispatch($booking->fresh()));
+        $this->actingAs($this->staff)->get(route('staff.events.show', $booking))
+            ->assertOk()
+            ->assertSee('name="items[0][quantity]"', false);
+
+        $unpaidBooking = Booking::create([
+            'client_id' => $this->booking->client_id,
+            'staff_id' => $this->staff->id,
+            'event_type' => 'wedding',
+            'event_date' => now()->addDays(30)->toDateString(),
+            'preparation_start_date' => now()->addDay()->toDateString(),
+            'venue' => 'Unpaid Event Hall',
+            'status' => 'confirmed',
+            'confirmed_at' => now(),
+        ]);
+        BookingItem::create([
+            'booking_id' => $unpaidBooking->id,
+            'inventory_item_id' => $this->arch->id,
+            'item_name' => $this->arch->name,
+            'quantity' => 2,
+            'confirmed_at' => now(),
+            'fresh_procurement_override' => false,
+        ]);
+        InventoryTransaction::create([
+            'inventory_item_id' => $this->arch->id,
+            'booking_id' => $unpaidBooking->id,
+            'quantity_change' => -2,
+            'transaction_type' => 'booking_lock',
+            'reason' => 'Preparation reservation',
+            'performed_by' => $this->admin->id,
+        ]);
+        $this->assertFalse($workspace->canDispatch($unpaidBooking));
+        $this->actingAs($this->staff)->get(route('staff.events.show', $unpaidBooking))
+            ->assertOk()
+            ->assertSee('Dispatch is locked until a down payment or full payment is verified.')
+            ->assertDontSee('name="items[0][quantity]"', false);
+    }
+
     private function user(string $role, string $email): User
     {
         return User::create([

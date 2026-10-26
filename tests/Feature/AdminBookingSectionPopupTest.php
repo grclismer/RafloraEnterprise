@@ -112,8 +112,30 @@ class AdminBookingSectionPopupTest extends TestCase
         $staff = User::create(['name' => 'Staff User', 'email' => 'staff-' . uniqid() . '@example.com', 'password' => bcrypt('password123'), 'role' => 'staff', 'email_verified_at' => now()]);
         $booking = $this->booking();
         $client = \App\Models\Client::create(['full_name' => 'Client User', 'email' => 'client-' . uniqid() . '@example.com', 'phone' => '09171234567']);
-        $booking->forceFill(['status' => 'downpayment_received', 'confirmed_at' => now(), 'staff_id' => $staff->id, 'client_id' => $client->id])->save();
+        $booking->forceFill([
+            'status' => 'downpayment_received',
+            'confirmed_at' => now(),
+            'staff_id' => $staff->id,
+            'client_id' => $client->id,
+            'event_date' => now()->addDays(30)->toDateString(),
+            'preparation_start_date' => now()->toDateString(),
+        ])->save();
         $item = \App\Models\InventoryItem::create(['name' => 'Tree Trunk', 'category' => 'props', 'is_perishable' => false, 'current_stock' => 50, 'unit_cost' => 50, 'min_stock' => 1, 'unit' => 'piece']);
+        $booking->bookingItems()->create([
+            'inventory_item_id' => $item->id,
+            'item_name' => $item->name,
+            'quantity' => 4,
+            'confirmed_at' => now(),
+        ]);
+        \App\Models\Payment::create([
+            'booking_id' => $booking->id,
+            'amount' => 100,
+            'payment_type' => 'bank_transfer',
+            'payment_option' => 'downpayment',
+            'reference_number' => 'VERIFIED-' . uniqid(),
+            'status' => 'downpayment_received',
+            'verified_at' => now(),
+        ]);
         $this->transaction($booking, $item, 'booking_lock', -4);
 
         return [$booking, $item];

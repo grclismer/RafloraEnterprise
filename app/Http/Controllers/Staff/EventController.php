@@ -47,6 +47,8 @@ class EventController extends Controller
             'dispatchedQuantities' => $dispatchedQuantities,
             'bookingMessages' => $bookingMessages,
             'aiMaterials' => $assignedBooking->aiAnalyses()->latest('analyzed_at')->first()?->suggested_materials ?? [],
+            'canDispatch' => $workspace->canDispatch($assignedBooking),
+            'dispatchLockMessage' => $workspace->dispatchLockMessage($assignedBooking),
         ]);
     }
 
@@ -319,6 +321,8 @@ class EventController extends Controller
     {
         return app(\App\Services\ReturnRecordService::class)->dispatchedQuantities($booking);
     }
+
+
 
     public function dispatchItems(Request $request, Booking $booking, \App\Services\InventoryDispatchService $dispatchService)
     {

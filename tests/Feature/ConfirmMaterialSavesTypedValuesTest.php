@@ -58,6 +58,39 @@ class ConfirmMaterialSavesTypedValuesTest extends TestCase
         $this->assertTrue(\App\Models\AuditLog::where('action', 'quote_line_updated')->exists());
     }
 
+    public function test_confirming_a_combined_row_confirms_all_source_lines_and_preserves_their_prices(): void
+    {
+        $first = $this->line($this->roses, 10, 70);
+        $second = $this->line($this->roses, 30, 90);
+        $this->assertSame([10.0, 30.0], [(float) $first->quantity, (float) $second->quantity]);
+
+        $this->actingAs($this->admin)
+            ->get(route('admin.bookings.show', $this->booking))
+            ->assertOk()
+            ->assertSee('Combined 2 lines');
+
+        $this->actingAs($this->admin)
+            ->post(route('admin.bookings.items.confirm', [$this->booking, $first]), [
+                'booking_item_ids' => [$first->id, $second->id],
+                'quantity' => 100,
+                'unit_price' => '85',
+            ])
+            ->assertSessionHas('success', '2 materials confirmed for this booking.');
+
+        $this->assertSame([25.0, 75.0], [
+            (float) $first->fresh()->quantity,
+            (float) $second->fresh()->quantity,
+        ]);
+        $this->assertSame([70.0, 90.0], [
+            (float) $first->fresh()->quoted_unit_price,
+            (float) $second->fresh()->quoted_unit_price,
+        ]);
+        $this->assertNotNull($first->fresh()->confirmed_at);
+        $this->assertNotNull($second->fresh()->confirmed_at);
+        $this->assertSame(100.0, (float) $this->roses->fresh()->bookings()
+            ->whereKey($this->booking->id)->sum('booking_items.quantity'));
+    }
+
     public function test_confirm_material_without_typed_values_still_confirms_the_saved_ones(): void
     {
         $line = $this->line($this->roses, 250, 80);
@@ -196,7 +229,7 @@ class ConfirmMaterialSavesTypedValuesTest extends TestCase
 
         $html = $this->actingAs($this->admin)->get(route('admin.bookings.show', $this->booking))->assertOk()->getContent();
 
-        $this->assertStringContainsString('name="quantity" value="10" data-sync-item="' . $line->id . '"', $html);
+        $this->assertStringContainsString('name="quantity" value="10" data-sync-group-row="0"', $html);
         $this->assertStringContainsString('name="lines[' . $line->id . '][unit_price]" value="50.00"', $html);
         $this->assertStringContainsString('function syncConfirmLineValues()', $html);
     }

@@ -6,6 +6,7 @@ use App\Models\Booking;
 use App\Models\BookingItem;
 use App\Models\Quotation;
 use App\Models\QuotationHistory;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 class QuotationIssuanceService
@@ -67,7 +68,7 @@ class QuotationIssuanceService
             // ------------------------------------------------------------------
             // 1. Load the quotable booking items (confirmed, with a quantity, not removed)
             // ------------------------------------------------------------------
-            $booking->load('bookingItems');
+            $booking->load('bookingItems.inventoryItem');
             $confirmedItems = $this->pricingService->quotableItems($booking);
 
             if ($confirmedItems->isEmpty()) {
@@ -114,20 +115,33 @@ class QuotationIssuanceService
             // ------------------------------------------------------------------
             // 4. Build the items snapshot (Admin-approved prices only, no AI metadata)
             // ------------------------------------------------------------------
-            $itemsSnapshot = $confirmedItems->map(function (BookingItem $item) use ($multiplier): array {
-                $qty   = (float) $item->quantity;
-                $price = (float) $item->quoted_unit_price;
-                $sellingUnitPrice = $price * $multiplier;
-                
-                return [
-                    'item_name'        => $item->item_name,
-                    'quantity'         => $qty,
-                    'quoted_unit_price'=> $price,
-                    'amount'           => round($qty * $price, 2),
-                    'selling_unit_price' => $sellingUnitPrice,
-                    'selling_amount'     => round($qty * $sellingUnitPrice, 2),
-                ];
-            })->values()->toArray();
+            $itemsSnapshot = $confirmedItems
+                ->groupBy(fn (BookingItem $item): string => $item->inventory_item_id
+                    ? 'inventory:' . $item->inventory_item_id
+                    : 'booking-line:' . $item->id)
+                ->map(function (Collection $lines) use ($multiplier): array {
+                    /** @var BookingItem $first */
+                    $first = $lines->first();
+                    $quantity = (float) $lines->sum(fn (BookingItem $item) => (float) $item->quantity);
+                    $amount = round((float) $lines->sum(
+                        fn (BookingItem $item) => (float) $item->quantity * (float) $item->quoted_unit_price
+                    ), 2);
+                    $quotedUnitPrice = $quantity > 0
+                        ? $amount / $quantity
+                        : (float) $first->quoted_unit_price;
+                    $sellingUnitPrice = $quotedUnitPrice * $multiplier;
+
+                    return [
+                        'item_name' => $first->inventoryItem?->name ?? $first->item_name,
+                        'quantity' => $quantity,
+                        'quoted_unit_price' => $quotedUnitPrice,
+                        'amount' => $amount,
+                        'selling_unit_price' => $sellingUnitPrice,
+                        'selling_amount' => round($amount * $multiplier, 2),
+                    ];
+                })
+                ->values()
+                ->toArray();
 
             // ------------------------------------------------------------------
             // 6. Determine next version number

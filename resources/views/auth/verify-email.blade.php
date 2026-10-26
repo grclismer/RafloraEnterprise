@@ -88,7 +88,7 @@
             @if($errors->any() && !$errors->has('resend'))
                 <div class="mb-6 p-3 rounded-lg bg-raflora-danger-50 border border-red-200 text-raflora-danger text-sm" aria-live="assertive">
                     <ul class="space-y-1">
-                        @foreach($errors->except('resend') as $error)
+                        @foreach(collect($errors->getMessages())->except('resend')->flatten() as $error)
                             <li>{{ $error }}</li>
                         @endforeach
                     </ul>

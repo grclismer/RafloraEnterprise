@@ -3,9 +3,11 @@
 namespace Tests\Feature;
 
 use App\Models\Booking;
+use App\Models\BookingItem;
 use App\Models\Client;
 use App\Models\InventoryItem;
 use App\Models\InventoryTransaction;
+use App\Models\Payment;
 use App\Models\User;
 use App\Services\InventoryDispatchService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -33,11 +35,29 @@ class InventoryDispatchServiceTest extends TestCase
         // 2. Setup Booking 1 (The one we will dispatch)
         $booking1 = Booking::create([
             'event_type' => 'wedding',
-            'event_date' => now()->addDays(10)->toDateString(),
+            'event_date' => now()->addDays(30)->toDateString(),
+            'preparation_start_date' => now()->subDay()->toDateString(),
             'status' => 'confirmed',
             'guest_email' => 'guest1@example.com',
             'confirmed_at' => now(), // explicitly confirmed
         ]);
+        BookingItem::create([
+            'booking_id' => $booking1->id,
+            'inventory_item_id' => $item->id,
+            'item_name' => $item->name,
+            'quantity' => 10,
+            'confirmed_at' => now(),
+        ]);
+        Payment::create([
+            'booking_id' => $booking1->id,
+            'amount' => 100,
+            'payment_type' => 'bank_transfer',
+            'payment_option' => 'downpayment',
+            'reference_number' => 'VERIFIED-' . uniqid(),
+            'status' => 'downpayment_received',
+            'verified_at' => now(),
+        ]);
+        $this->assertTrue($booking1->hasPreparationStarted());
 
         // Confirmed requirement: 10 units
         InventoryTransaction::create([
@@ -131,10 +151,27 @@ class InventoryDispatchServiceTest extends TestCase
 
         $booking = Booking::create([
             'event_type' => 'wedding',
-            'event_date' => now()->addDays(10)->toDateString(),
+            'event_date' => now()->addDays(30)->toDateString(),
+            'preparation_start_date' => now()->addDays(5)->toDateString(),
             'status' => 'confirmed',
             'guest_email' => 'guest@example.com',
             'confirmed_at' => now(),
+        ]);
+        BookingItem::create([
+            'booking_id' => $booking->id,
+            'inventory_item_id' => $item->id,
+            'item_name' => $item->name,
+            'quantity' => 10,
+            'confirmed_at' => now(),
+        ]);
+        Payment::create([
+            'booking_id' => $booking->id,
+            'amount' => 100,
+            'payment_type' => 'bank_transfer',
+            'payment_option' => 'downpayment',
+            'reference_number' => 'VERIFIED-' . uniqid(),
+            'status' => 'downpayment_received',
+            'verified_at' => now(),
         ]);
 
         InventoryTransaction::create([

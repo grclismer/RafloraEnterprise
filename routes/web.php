@@ -463,6 +463,7 @@ Route::prefix('admin')->middleware(['auth', 'admin', 'admin.setup'])->group(func
     Route::post('/bookings/{booking}/decline', [AdminBookingController::class, 'decline'])->name('admin.bookings.decline');
     Route::post('/bookings/{booking}/reserve-materials', [AdminBookingController::class, 'reserveMaterials'])->name('admin.bookings.reserve-materials');
     Route::post('/bookings/{booking}/confirm-fresh-flowers', [AdminBookingController::class, 'confirmFreshFlowers'])->name('admin.bookings.confirm-fresh-flowers');
+    Route::post('/bookings/{booking}/items/{bookingItem}/fresh-procurement', [AdminBookingController::class, 'updateFreshProcurementClassification'])->name('admin.bookings.items.fresh-procurement');
     Route::post('/bookings/{booking}/delivery-received', [AdminBookingController::class, 'markDeliveryReceived'])->name('admin.bookings.delivery-received');
     Route::post('/bookings/{booking}/schedule-requests/{scheduleRequest}', [AdminBookingController::class, 'decideScheduleRequest'])->name('admin.bookings.schedule-requests.decide');
     Route::post('/bookings/{booking}/resolve-shortages', [AdminBookingController::class, 'resolveBookingShortages'])->name('admin.bookings.resolve-shortages');

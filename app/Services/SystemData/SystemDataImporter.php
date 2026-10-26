@@ -902,6 +902,7 @@ class SystemDataImporter
                     'is_ai_suggested' => (bool) ($bi['is_ai_suggested'] ?? false),
                     'confirmed_at' => DateTimeNormalizer::normalizeDateTime($bi['confirmed_at'] ?? null),
                     'procurement_status' => $bi['procurement_status'] ?? 'pending',
+                    'fresh_procurement_override' => $bi['fresh_procurement_override'] ?? null,
                     'suggested_order_date' => DateTimeNormalizer::normalizeDate($bi['suggested_order_date'] ?? null),
                     'suggested_delivery_date' => DateTimeNormalizer::normalizeDate($bi['suggested_delivery_date'] ?? null),
                     'notes' => $bi['notes'] ?? null,

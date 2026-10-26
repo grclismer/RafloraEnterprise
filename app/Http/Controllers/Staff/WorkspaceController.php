@@ -220,7 +220,11 @@ class WorkspaceController extends Controller
         }
 
         $rows = $bookings
-            ->map(fn (Booking $b) => ['booking' => $b, 'rows' => $this->workspace->dispatchRows($b)])
+            ->map(fn (Booking $booking) => [
+                'booking' => $booking,
+                'rows' => $this->workspace->dispatchRows($booking),
+                'can_dispatch' => $this->workspace->canDispatch($booking),
+            ])
             ->filter(fn ($entry) => $entry['rows']->isNotEmpty())
             ->values();
 

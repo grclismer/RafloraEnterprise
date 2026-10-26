@@ -135,11 +135,14 @@
         <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
             <h3 class="font-bold text-slate-900">Confirmed materials & Dispatch</h3>
             <p class="mt-1 text-sm text-slate-500">Materials currently recorded and their dispatch status.</p>
+            @if(!$canDispatch && $dispatchLockMessage)
+                <p class="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">{{ $dispatchLockMessage }}</p>
+            @endif
 
             @php
                 $hasDispatchable = false;
                 foreach ($booking->bookingItems as $i) {
-                    if ($i->inventoryItem && !$i->inventoryItem->is_perishable) {
+                    if ($i->inventoryItem && $i->confirmed_at && (float) $i->quantity > 0 && !$i->requiresFreshProcurement()) {
                         $hasDispatchable = true;
                         break;
                     }
@@ -150,7 +153,7 @@
                 {{-- Mobile Stacked Cards (<sm) to prevent horizontal overflow on small screens --}}
                 <div class="mt-5 space-y-3 sm:hidden">
                     @foreach($booking->bookingItems as $item)
-                        @if($item->inventoryItem && !$item->inventoryItem->is_perishable)
+                        @if($item->inventoryItem && $item->confirmed_at && (float) $item->quantity > 0 && !$item->requiresFreshProcurement())
                             @php
                                 $lock = abs(\App\Models\InventoryTransaction::where('inventory_item_id', $item->inventoryItem->id)->where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->sum('quantity_change'));
                                 $release = \App\Models\InventoryTransaction::where('inventory_item_id', $item->inventoryItem->id)->where('booking_id', $booking->id)->where('transaction_type', 'booking_release')->sum('quantity_change');
@@ -180,7 +183,7 @@
                                         <p class="mt-0.5 text-sm font-semibold {{ $outstanding > 0 ? 'text-amber-700' : 'text-slate-700' }}">{{ $outstanding > 0 ? $outstanding : 0 }}</p>
                                     </div>
                                 </div>
-                                @if($outstanding > 0)
+                                @if($outstanding > 0 && $canDispatch)
                                     <form method="POST" action="{{ route('staff.events.dispatch', $booking) }}" class="mt-3 flex items-center gap-2">
                                         @csrf
                                         <input type="hidden" name="items[0][inventory_item_id]" value="{{ $item->inventoryItem->id }}">
@@ -200,6 +203,8 @@
                                             Dispatch
                                         </button>
                                     </form>
+                                @elseif($outstanding > 0)
+                                    <p class="mt-3 text-xs font-medium text-amber-700">Dispatch is currently locked.</p>
                                 @endif
                             </div>
                         @endif
@@ -220,7 +225,7 @@
                         </thead>
                         <tbody class="divide-y divide-slate-100">
                             @foreach($booking->bookingItems as $item)
-                                @if($item->inventoryItem && !$item->inventoryItem->is_perishable)
+                                @if($item->inventoryItem && $item->confirmed_at && (float) $item->quantity > 0 && !$item->requiresFreshProcurement())
                                     @php
                                         $lock = abs(\App\Models\InventoryTransaction::where('inventory_item_id', $item->inventoryItem->id)->where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->sum('quantity_change'));
                                         $release = \App\Models\InventoryTransaction::where('inventory_item_id', $item->inventoryItem->id)->where('booking_id', $booking->id)->where('transaction_type', 'booking_release')->sum('quantity_change');
@@ -233,7 +238,7 @@
                                         <td class="px-3 py-3 text-slate-600">{{ $netDispatch }}</td>
                                         <td class="px-3 py-3 text-slate-600">{{ $outstanding > 0 ? $outstanding : 0 }}</td>
                                         <td class="px-3 py-3">
-                                            @if($outstanding > 0)
+                                            @if($outstanding > 0 && $canDispatch)
                                                 <form method="POST" action="{{ route('staff.events.dispatch', $booking) }}" class="flex items-center gap-2">
                                                     @csrf
                                                     <input type="hidden" name="items[0][inventory_item_id]" value="{{ $item->inventoryItem->id }}">
@@ -250,6 +255,8 @@
                                                            placeholder="Qty">
                                                     <button type="submit" class="rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 transition">Dispatch</button>
                                                 </form>
+                                            @elseif($outstanding > 0)
+                                                <span class="text-xs text-amber-700 font-medium">Dispatch locked</span>
                                             @else
                                                 <span class="text-xs text-slate-400 font-medium">Fully dispatched</span>
                                             @endif

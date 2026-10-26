@@ -436,7 +436,12 @@ class BookingWorkflowService
             ? $booking->inventoryTransactions
             : $booking->inventoryTransactions()->with('inventoryItem')->get();
 
-        return $transactions->filter(fn ($tx) => $tx->inventoryItem && !$tx->inventoryItem->is_perishable)->values();
+        $reusableIds = $booking->reusableBookingItems()
+            ->pluck('inventory_item_id')
+            ->map(fn ($id) => (int) $id)
+            ->unique();
+
+        return $transactions->filter(fn ($tx) => $tx->inventoryItem && $reusableIds->contains((int) $tx->inventory_item_id))->values();
     }
 
     private function netLocked(Collection $transactions): float

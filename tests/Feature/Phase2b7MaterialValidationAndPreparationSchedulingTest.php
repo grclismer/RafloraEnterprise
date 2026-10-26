@@ -216,8 +216,9 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
     public function test_admin_can_define_and_adjust_preparation_start_date(): void
     {
         $admin = $this->createAdmin();
-        $eventDate = Carbon::today()->addDays(20);
+        $eventDate = Carbon::today()->addDays(30);
         $booking = $this->createBooking(['event_date' => $eventDate]);
+        $this->createVerifiedPayment($booking);
 
         $prepDate = Carbon::today()->addDays(15)->toDateString();
 
@@ -254,20 +255,73 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
         $this->assertTrue($booking->isInPreparationPeriod());
     }
 
-    public function test_preparation_start_date_cannot_be_after_event_date(): void
+    public function test_admin_can_schedule_preparation_from_october_24_through_october_28_for_november_30_event(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-10-23 18:30:00'));
+
+        try {
+            $admin = $this->createAdmin();
+            $eventDate = Carbon::parse('2026-11-30');
+            $booking = $this->createBooking(['event_date' => $eventDate]);
+            $this->createVerifiedPayment($booking);
+
+            foreach (range(24, 28) as $day) {
+                $prepDate = Carbon::create(2026, 10, $day)->toDateString();
+                $response = $this->actingAs($admin)->put(route('admin.bookings.update', $booking), [
+                    'event_type' => $booking->event_type,
+                    'event_date' => $eventDate->toDateString(),
+                    'venue' => $booking->venue,
+                    'status' => $booking->status,
+                    'preparation_start_date' => $prepDate,
+                ]);
+
+                $response->assertSessionHasNoErrors();
+                $this->assertSame($prepDate, $booking->fresh()->preparation_start_date->toDateString());
+            }
+        } finally {
+            Carbon::setTestNow();
+        }
+    }
+
+    public function test_preparation_start_date_must_be_today_or_later_and_at_least_fourteen_days_before_event(): void
     {
         $admin = $this->createAdmin();
-        $eventDate = Carbon::today()->addDays(10);
+        $eventDate = Carbon::today()->addDays(30);
         $booking = $this->createBooking(['event_date' => $eventDate]);
+        $this->createVerifiedPayment($booking);
 
-        $invalidPrepDate = Carbon::today()->addDays(12)->toDateString();
+        $invalidPrepDates = [
+            Carbon::yesterday()->toDateString(),
+            $eventDate->copy()->subDays(13)->toDateString(),
+            $eventDate->toDateString(),
+        ];
+
+        foreach ($invalidPrepDates as $invalidPrepDate) {
+            $response = $this->actingAs($admin)->put(route('admin.bookings.update', $booking), [
+                'event_type' => $booking->event_type,
+                'event_date' => $eventDate->toDateString(),
+                'venue' => $booking->venue,
+                'status' => $booking->status,
+                'preparation_start_date' => $invalidPrepDate,
+            ]);
+
+            $response->assertSessionHasErrors(['preparation_start_date']);
+        }
+        $this->assertNull($booking->fresh()->preparation_start_date);
+    }
+
+    public function test_preparation_date_cannot_be_set_before_payment_is_verified(): void
+    {
+        $admin = $this->createAdmin();
+        $eventDate = Carbon::today()->addDays(30);
+        $booking = $this->createBooking(['event_date' => $eventDate]);
 
         $response = $this->actingAs($admin)->put(route('admin.bookings.update', $booking), [
             'event_type' => $booking->event_type,
             'event_date' => $eventDate->toDateString(),
             'venue' => $booking->venue,
             'status' => $booking->status,
-            'preparation_start_date' => $invalidPrepDate,
+            'preparation_start_date' => Carbon::today()->toDateString(),
         ]);
 
         $response->assertSessionHasErrors(['preparation_start_date']);
@@ -278,12 +332,12 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
     // 4. INVENTORY RESERVATION & FRESH FLOWERS
     // ==========================================
 
-    public function test_payment_verification_delays_reusable_reservation_when_prep_date_in_future(): void
+    public function test_payment_verification_reserves_reusable_inventory_when_valid_prep_date_is_in_future(): void
     {
         $admin = $this->createAdmin();
         [$clientUser, $client] = $this->createClientWithUser();
-        $eventDate = Carbon::today()->addDays(30);
-        $prepDate = Carbon::today()->addDays(25);
+        $eventDate = Carbon::today()->addDays(50);
+        $prepDate = Carbon::today()->addDays(30);
 
         $booking = Booking::create([
             'client_id' => $client->id,
@@ -321,20 +375,20 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
         $booking->refresh();
         $this->assertSame('downpayment_received', $booking->status);
 
-        // Crucial requirement: Reusable inventory is NOT reserved yet because prep date is in future
-        $this->assertSame(0.0, (float) $hardware->fresh()->reserved_stock);
-        $this->assertSame(0, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
+        $this->assertSame(2.0, (float) $hardware->fresh()->reserved_stock);
+        $this->assertSame(1, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
     }
 
     public function test_fresh_flowers_do_not_create_booking_locks(): void
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking([
-            'event_date' => Carbon::today()->addDays(2),
-            'preparation_start_date' => Carbon::today(),
+            'event_date' => Carbon::today()->addDays(30),
+            'preparation_start_date' => Carbon::today()->addDays(5),
             'preparation_status' => 'in_preparation',
             'status' => 'confirmed',
         ]);
+        $this->createVerifiedPayment($booking);
 
         // Perishable fresh flowers
         $flowers = $this->createInventoryItem('Ecuadorian Red Roses', 'flowers', true, 100);
@@ -356,15 +410,54 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
         $this->assertSame(0, InventoryTransaction::where('booking_id', $booking->id)->where('transaction_type', 'booking_lock')->count());
     }
 
+    public function test_admin_can_reclassify_a_fresh_item_as_reusable_for_one_booking_without_deleting_it(): void
+    {
+        $admin = $this->createAdmin();
+        $booking = $this->createBooking([
+            'event_date' => Carbon::today()->addDays(30),
+            'preparation_start_date' => Carbon::today()->addDays(5),
+            'status' => 'confirmed',
+        ]);
+        $this->createVerifiedPayment($booking);
+        $item = $this->createInventoryItem('Artificial Rose Stem', 'flowers', true, 10);
+        $bookingItem = $booking->bookingItems()->create([
+            'inventory_item_id' => $item->id,
+            'item_name' => $item->name,
+            'quantity' => 2,
+            'confirmed_at' => now(),
+            'procurement_status' => 'pending',
+        ]);
+
+        $response = $this->actingAs($admin)->post(
+            route('admin.bookings.items.fresh-procurement', [$booking, $bookingItem]),
+            ['fresh_procurement' => '0']
+        );
+
+        $response->assertRedirect();
+        $this->assertDatabaseHas('booking_items', [
+            'id' => $bookingItem->id,
+            'booking_id' => $booking->id,
+            'fresh_procurement_override' => 0,
+        ]);
+        $this->assertTrue((bool) $item->fresh()->is_perishable);
+        $this->assertSame(1, $booking->bookingItems()->count());
+
+        $this->actingAs($admin)->post(route('admin.bookings.reserve-materials', $booking));
+
+        $this->assertSame(2.0, (float) $item->fresh()->reserved_stock);
+        $this->assertTrue($booking->fresh()->areFreshFlowersReady());
+    }
+
     public function test_admin_can_reserve_reusable_materials_at_preparation_period(): void
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking([
-            'event_date' => Carbon::today()->addDays(3),
+            'event_date' => Carbon::today()->addDays(30),
             'preparation_start_date' => Carbon::today(),
             'preparation_status' => 'scheduled',
             'status' => 'confirmed',
         ]);
+        $this->createVerifiedPayment($booking);
 
         $reusable = $this->createInventoryItem('Centerpiece Stand', 'props', false, 10);
 
@@ -398,6 +491,7 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['status' => 'confirmed', 'preparation_start_date' => now()->toDateString()]);
+        $this->createVerifiedPayment($booking);
 
         $scarceHardware = $this->createInventoryItem('Neon Arch 2026', 'props', false, 1);
 
@@ -422,6 +516,7 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
     {
         $admin = $this->createAdmin();
         $booking = $this->createBooking(['status' => 'confirmed', 'preparation_start_date' => now()->toDateString()]);
+        $this->createVerifiedPayment($booking);
         $hardware = $this->createInventoryItem('Floral Pedestal', 'props', false, 10);
 
         $booking->bookingItems()->create([
@@ -529,8 +624,6 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
             'status' => 'pending',
             'action' => 'send_quotation',
             'final_quoted_price' => 4000,
-            'preparation_start_date' => Carbon::today()->addDays(15)->toDateString(),
-            'preparation_status' => 'scheduled',
             'items' => [
                 ['booking_item_id' => $backdropItem->id, 'item_name' => $backdropInv->name, 'quantity' => 1, 'unit_price' => 2000],
                 ['booking_item_id' => $rosesItem->id, 'item_name' => $freshRoses->name, 'quantity' => 20, 'unit_price' => 100],
@@ -582,8 +675,14 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
         $this->assertSame(1.0, (float) $backdropInv->fresh()->current_stock);
 
         // Step 11: Event reaches preparation period -> Admin reserves reusable inventory
-        $booking->preparation_start_date = Carbon::today();
-        $booking->save();
+        $scheduleResponse = $this->actingAs($admin)->put(route('admin.bookings.update', $booking), [
+            'event_type' => $booking->event_type,
+            'event_date' => $eventDate->toDateString(),
+            'venue' => $booking->venue,
+            'status' => $booking->status,
+            'preparation_start_date' => Carbon::today()->toDateString(),
+        ]);
+        $scheduleResponse->assertRedirect();
 
         $this->actingAs($admin)->post(route('admin.bookings.reserve-materials', $booking));
 
@@ -660,6 +759,19 @@ class Phase2b7MaterialValidationAndPreparationSchedulingTest extends TestCase
             'unit_cost' => 100,
             'min_stock' => 1,
             'unit' => $isPerishable ? 'stem' : 'piece',
+        ]);
+    }
+
+    private function createVerifiedPayment(Booking $booking): Payment
+    {
+        return Payment::create([
+            'booking_id' => $booking->id,
+            'amount' => 100,
+            'payment_type' => 'bank_transfer',
+            'payment_option' => 'downpayment',
+            'reference_number' => 'VERIFIED-' . uniqid(),
+            'status' => 'downpayment_received',
+            'verified_at' => now(),
         ]);
     }
 }

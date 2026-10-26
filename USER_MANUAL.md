@@ -259,16 +259,19 @@ The sidebar groups: **Overview** (Dashboard), **Bookings** (Booking Management, 
    2. Click **Complete Raflora Review**. Confirming, linking or promoting any material also completes the review.
 2. **Material Preparation / Validation** (Quotation pop-up → *Material review & quotation*)
    - **Confirm Material** for each AI-suggested line, or **Confirm all linked (N)** to confirm every line that is already linked to inventory.
-   - **Unmatched / AI Suggestion** lines (no exact inventory name match):
+   - **Unmatched / AI Suggestion** lines (not yet linked to inventory):
      - **Link to Existing Inventory** picks an existing catalog item;
-     - **Promote to Catalog** creates a new inventory item; set its type (perishable = fresh, not perishable = artificial).
+     - **Promote to Catalog** creates a new inventory item only when no likely duplicate is detected. If the name resembles an existing item, review the candidates; link the right item or explicitly confirm that it is genuinely different.
    - Adjust quantities and unit costs, or tick **Remove** for lines not needed.
+   - Known names such as "Floral Foam Brick" and "Floral Foam Blocks" match the canonical foam item. If the suggested unit differs from the catalog unit, the system asks Admin to link it manually rather than silently combining stock units. Spelling/word-order lookalikes are held for review before a new catalog item can be created. After linking, the analysis-only suggestion is removed from the unmatched list.
 3. **Quotation**
    1. Check the **Pricing** panel: BOM subtotal × markup multiplier = calculated total. Optionally type a **Final Quoted Total (Override)**.
-   2. Write a note to the client if needed.
-   3. Click **Approve & Send Official Quote to Client**. The status becomes *Quotation Sent* and the quotation is valid for 7 days.
-   4. If it expires, click **Re-issue Quotation (Refresh 7-Day Window)**.
-   5. For long-term bookings, reconfirm the price when prompted: unchanged, or a revised quote.
+   2. Lines linked to the same inventory item appear as one row with their quantities combined, including while awaiting confirmation. Confirming that row confirms all of its source lines; the underlying booking lines remain separate. The client-facing image-based suggestions remain unchanged.
+   3. The notification **Add Missing AI Items to Inventory** action links recognized catalog matches, creates clearly new items, and skips likely lookalikes for review from the booking. CSV import also stops on likely duplicate names; it does not silently create another catalog record.
+   3. Write a note to the client if needed.
+   4. Click **Approve & Send Official Quote to Client**. The status becomes *Quotation Sent* and the quotation is valid for 7 days.
+   5. If it expires, click **Re-issue Quotation (Refresh 7-Day Window)**.
+   6. For long-term bookings, reconfirm the price when prompted: unchanged, or a revised quote.
 4. **Change requests from the client**
    - The chat shows a **Change Request** card. **Review & Update Quotation** opens the Quotation pop-up.
    - For a **Schedule** request, a **Schedule change requested** panel appears beside Approve & Send, with:
@@ -283,10 +286,11 @@ The sidebar groups: **Overview** (Dashboard), **Bookings** (Booking Management, 
    - Check the reference against Raflora's GCash or bank records, then **Verify** (the booking is confirmed) or **Reject** (the client is asked for a corrected reference).
 8. **Staff Assignment**: assign an operations staff member. This is needed from the Confirmed stage onward.
 9. **Preparation & Reservation** (Preparation pop-up)
-   1. **Schedule Preparation**: set the preparation start date (not after the event date) and click **Save Date**.
-   2. **Reserve Materials** locks the reusable materials. This is allowed once the preparation date has arrived.
-   3. **Fresh Flower Procurement** appears only when the booking has perishable items. Click **Confirm Fresh Flowers** once they are bought.
-10. **Dispatch**: enter the quantity per item and dispatch it. Admin or the assigned Staff can do this, and stock is deducted. Mistakes can be fixed with a dispatch correction.
+   1. Operational preparation and dispatch are locked until Admin verifies a down payment or full payment.
+   2. **Schedule Preparation**: choose a date from today through at least 14 days before the event date. The valid range is calculated for each booking; past dates and dates within the final 14 days before the event are not allowed.
+   3. **Reserve Materials** locks reusable materials as soon as payment is verified and a valid preparation date is saved. The scheduled date records when preparation is planned; it does not delay reservation or procurement. Fresh/perishable items are not placed on reusable-stock reservations.
+   4. **Fresh Flower Procurement** appears for confirmed booking items classified for fresh procurement. Review item names, quantities and statuses before confirming. Admin can reclassify an incorrectly listed item as reusable inventory for this booking; the booking item remains, and the inventory catalog classification is unchanged.
+10. **Dispatch**: after payment is verified and a valid preparation date is saved, enter the quantity per item and dispatch it. Admin or the assigned Staff can do this, and stock is deducted. Mistakes can be fixed with a dispatch correction.
 11. **Event Execution**: in Overview → **Operational Actions**, click **Mark Event In Progress**. The system checks fresh-flower readiness, dispatch and locked stock first.
     - The Next-step shortcut changes to *Start Event · Mark In Progress* once everything is dispatched.
     - For Delivery orders the button reads **Mark Out for Delivery**.
@@ -345,6 +349,7 @@ The sidebar groups: **Overview** (Dashboard), **Bookings** (Booking Management, 
 2. **Edit** an item. **Receive Stock** adds delivered stock. **Adjust Stock** corrects the count with a reason.
 3. **Archive** an item. **Archived Items** lists them; **Restore** brings one back.
 4. **CSV**: **Download Template**, **Import Inventory CSV** (adds or updates in bulk), and **Export all inventory items**.
+5. Catalog matching recognizes only defined quantity/form variants (for example "Floral Foam Brick" and "Floral Foam Blocks"). Distinct foam shapes and composite products remain separate. Unit mismatches are flagged for manual review; do not merge stock records until their units and perishability are verified.
 
 ### 3.8 Return Tracking (`/admin/return-tracking`)
 

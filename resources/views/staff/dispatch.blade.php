@@ -81,9 +81,15 @@
                                 @else
                                     <span class="rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-bold text-amber-700 tabular-nums">{{ $outstandingCount }} items outstanding</span>
                                 @endif
-                                <a href="{{ route('staff.events.show', $b) }}#dispatch" class="rounded-xl bg-navy-900 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-navy-800 transition">
-                                    Manage Dispatch
-                                </a>
+                                @if($entry['can_dispatch'])
+                                    <a href="{{ route('staff.events.show', $b) }}#dispatch" class="rounded-xl bg-navy-900 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-navy-800 transition">
+                                        Manage Dispatch
+                                    </a>
+                                @else
+                                    <a href="{{ route('staff.events.show', $b) }}#dispatch" class="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-1.5 text-xs font-semibold text-amber-800">
+                                        Dispatch locked
+                                    </a>
+                                @endif
                             </div>
                         </div>
 
@@ -118,9 +124,13 @@
                                                     <span class="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 text-[10px] font-bold text-emerald-700">
                                                         <i class="fa-solid fa-check"></i> Dispatched
                                                     </span>
-                                                @else
+                                                @elseif($entry['can_dispatch'])
                                                     <span class="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-0.5 text-[10px] font-bold text-amber-700">
                                                         <i class="fa-solid fa-clock"></i> Pending
+                                                    </span>
+                                                @else
+                                                    <span class="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-0.5 text-[10px] font-bold text-slate-600">
+                                                        <i class="fa-solid fa-lock"></i> Locked
                                                     </span>
                                                 @endif
                                             </td>

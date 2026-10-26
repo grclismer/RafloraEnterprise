@@ -132,7 +132,7 @@ class ScheduleChangeService
                 $lockedBooking->end_time = substr((string) $locked->requested_end_time, 0, 5);
             }
             // A preparation start after the new event date would no longer make sense.
-            if ($lockedBooking->preparation_start_date && $lockedBooking->preparation_start_date->gt($locked->requested_date)) {
+            if ($lockedBooking->preparation_start_date && !$lockedBooking->isPreparationDateAllowed($lockedBooking->preparation_start_date, $locked->requested_date)) {
                 $lockedBooking->preparation_start_date = null;
             }
             $lockedBooking->save();

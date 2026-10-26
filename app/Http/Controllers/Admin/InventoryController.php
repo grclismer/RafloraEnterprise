@@ -201,6 +201,7 @@ class InventoryController extends Controller
             'supplier_contact_number' => 'nullable|string|max:50',
             'storage_location' => 'nullable|string|max:255',
             'tags' => 'nullable|string|max:500',
+            'confirm_distinct_catalog_item' => 'nullable|boolean',
             'substitute_ids' => 'nullable|array',
             'substitute_ids.*' => 'exists:inventory_items,id',
             'image' => 'nullable|image|max:5120',
@@ -208,6 +209,13 @@ class InventoryController extends Controller
 
         if ($duplicate = $this->duplicateNameMessage($validated['name'])) {
             return back()->withInput()->withErrors(['name' => $duplicate]);
+        }
+        if (($possibleMatches = InventoryItem::catalogSimilarityCandidates($validated['name']))->isNotEmpty()
+            && !$request->boolean('confirm_distinct_catalog_item')) {
+            return back()->withInput()->withErrors([
+                'name' => 'Possible catalog matches: ' . $possibleMatches->pluck('name')->implode(', ')
+                    . '. Review these items, then confirm below only if this is a genuinely different item.',
+            ]);
         }
 
         $initialQuantity = (float) ($validated['initial_quantity'] ?? $validated['current_stock'] ?? 0);
@@ -378,6 +386,7 @@ class InventoryController extends Controller
             'supplier_contact_number' => 'nullable|string|max:50',
             'storage_location' => 'nullable|string|max:255',
             'tags' => 'nullable|string|max:500',
+            'confirm_distinct_catalog_item' => 'nullable|boolean',
             'substitute_ids' => 'nullable|array',
             'substitute_ids.*' => 'exists:inventory_items,id',
             'image' => 'nullable|image|max:5120',
@@ -387,6 +396,14 @@ class InventoryController extends Controller
         if (InventoryItem::nameKey($validated['name']) !== InventoryItem::nameKey($inventoryItem->name)
             && ($duplicate = $this->duplicateNameMessage($validated['name'], $inventoryItem->id))) {
             return back()->withInput()->withErrors(['name' => $duplicate]);
+        }
+        if (InventoryItem::nameKey($validated['name']) !== InventoryItem::nameKey($inventoryItem->name)
+            && ($possibleMatches = InventoryItem::catalogSimilarityCandidates($validated['name'], $inventoryItem->id))->isNotEmpty()
+            && !$request->boolean('confirm_distinct_catalog_item')) {
+            return back()->withInput()->withErrors([
+                'name' => 'Possible catalog matches: ' . $possibleMatches->pluck('name')->implode(', ')
+                    . '. Review these items, then confirm below only if this is a genuinely different item.',
+            ]);
         }
 
         $minStock = (float) ($validated['reorder_level'] ?? $validated['min_stock'] ?? $inventoryItem->min_stock);
@@ -1097,9 +1114,13 @@ class InventoryController extends Controller
 
                 foreach ($rows as $row) {
                     // Same item when the name matches ignoring case, spacing and punctuation.
-                    ['exact' => $item, 'similar' => $similar] = InventoryItem::catalogMatches($row['name']);
+                    ['exact' => $item, 'similar' => $similar] = InventoryItem::catalogMatches($row['name'], unit: $row['unit']);
                     if (!$item && $similar) {
                         throw new \DomainException("\"{$row['name']}\" is too similar to the existing item \"{$similar->name}\". Use the existing name to update it, or a clearly different name.");
+                    }
+                    $possibleMatches = InventoryItem::catalogSimilarityCandidates($row['name']);
+                    if (!$item && $possibleMatches->isNotEmpty()) {
+                        throw new \DomainException("\"{$row['name']}\" may duplicate: " . $possibleMatches->pluck('name')->implode(', ') . '. Review the catalog and resolve this row before importing; no changes were made.');
                     }
 
                     if ($item) {

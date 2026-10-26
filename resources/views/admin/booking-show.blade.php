@@ -832,8 +832,8 @@
                             @unless($quoteReadOnly)
                                 {{-- Kept in step with the table by syncConfirmLineValues(); saved with the confirmation. --}}
                                 @foreach($readyToConfirm as $readyItem)
-                                    <input type="hidden" name="lines[{{ $readyItem->id }}][quantity]" value="{{ (int) $readyItem->quantity }}" data-sync-item="{{ $readyItem->id }}" data-sync-field="quantity">
-                                    <input type="hidden" name="lines[{{ $readyItem->id }}][unit_price]" value="{{ number_format((float) $readyItem->quoted_unit_price, 2, '.', '') }}" data-sync-item="{{ $readyItem->id }}" data-sync-field="unit_price">
+                                    <input type="hidden" name="lines[{{ $readyItem->id }}][quantity]" value="{{ (int) $readyItem->quantity }}" data-sync-item="{{ $readyItem->id }}" data-sync-field="quantity" data-original-quantity="{{ (float) $readyItem->quantity }}" data-original-price="{{ (float) $readyItem->quoted_unit_price }}">
+                                    <input type="hidden" name="lines[{{ $readyItem->id }}][unit_price]" value="{{ number_format((float) $readyItem->quoted_unit_price, 2, '.', '') }}" data-sync-item="{{ $readyItem->id }}" data-sync-field="unit_price" data-original-quantity="{{ (float) $readyItem->quantity }}" data-original-price="{{ (float) $readyItem->quoted_unit_price }}">
                                 @endforeach
                             @endunless
                             <button type="submit" class="{{ $btnPrimary }} py-1.5 text-xs">
@@ -867,10 +867,8 @@
                             @php
                                 $itemsToDisplay = [];
                                 $seenItemKeys = [];
-                                // Every saved booking line is listed, even two with the same name: each one is
-                                // quoted, so each must be visible to price or remove. Unsaved AI suggestions and
-                                // fallback rows are skipped when a line with that name is already listed.
-                                $addDisplayItem = function ($id, $name, $qty, $unitPrice, $inventoryId = null, $isAiSuggested = false, $notes = null, $confirmedAt = null) use (&$itemsToDisplay, &$seenItemKeys) {
+                                // Keep source booking lines separate until they are linked and confirmed.
+                                $addDisplayItem = function ($id, $name, $qty, $unitPrice, $inventoryId = null, $isAiSuggested = false, $notes = null, $confirmedAt = null, $procurementStatus = null) use (&$itemsToDisplay, &$seenItemKeys) {
                                     $normalizedName = strtolower(trim((string) $name));
                                     if ($normalizedName === '') {
                                         return;
@@ -892,6 +890,8 @@
                                         'is_ai_suggested' => $isAiSuggested,
                                         'notes' => $notes,
                                         'confirmed_at' => $confirmedAt,
+                                        'procurement_status' => $procurementStatus,
+                                        'source_booking_item_ids' => $id ? [(int) $id] : [],
                                     ];
                                 };
 
@@ -906,15 +906,40 @@
                                             (bool) $bookingItem->is_ai_suggested,
                                             $bookingItem->notes,
                                             $bookingItem->confirmed_at,
+                                            $bookingItem->procurement_status,
                                         );
                                     }
                                 }
 
                                 if ($analysis) {
                                     foreach ($analysis->suggested_materials as $item) {
+                                        $suggestionName = $item['item_name'] ?? 'Unknown Item';
+                                        $suggestionKey = \App\Models\InventoryItem::nameKey($suggestionName);
+                                        $suggestionSingularKey = \App\Models\InventoryItem::singularNameKey($suggestionName);
+                                        $suggestionIdentity = \App\Models\InventoryItem::materialIdentityKey($suggestionName);
+                                        $alreadyLinked = $booking->bookingItems->contains(function ($bookingItem) use ($suggestionKey, $suggestionSingularKey, $suggestionIdentity, $allInventoryItems): bool {
+                                            if (!$bookingItem->inventory_item_id) {
+                                                return false;
+                                            }
+
+                                            $linkedInventory = $allInventoryItems->firstWhere('id', $bookingItem->inventory_item_id);
+                                            if (!$linkedInventory) {
+                                                return false;
+                                            }
+
+                                            return \App\Models\InventoryItem::nameKey($bookingItem->item_name) === $suggestionKey
+                                                || \App\Models\InventoryItem::singularNameKey($bookingItem->item_name) === $suggestionSingularKey
+                                                || \App\Models\InventoryItem::singularNameKey($linkedInventory->name) === $suggestionSingularKey
+                                                || ($suggestionIdentity !== ''
+                                                    && \App\Models\InventoryItem::materialIdentityKey($linkedInventory->name) === $suggestionIdentity);
+                                        });
+                                        if ($alreadyLinked) {
+                                            continue;
+                                        }
+
                                         $addDisplayItem(
                                             null,
-                                            $item['item_name'] ?? 'Unknown Item',
+                                            $suggestionName,
                                             $item['quantity'] ?? $item['estimated_quantity'] ?? 0,
                                             $item['estimated_unit_cost_php'] ?? 0,
                                             null,
@@ -939,6 +964,39 @@
                                         );
                                     }
                                 }
+
+                                $itemsToDisplay = collect($itemsToDisplay)
+                                    ->groupBy(function ($item): string {
+                                        if (!empty($item['id']) && !empty($item['inventory_id'])) {
+                                            return implode(':', [
+                                                'inventory',
+                                                $item['inventory_id'],
+                                                'ai',
+                                                (int) $item['is_ai_suggested'],
+                                                'confirmed',
+                                                (int) !empty($item['confirmed_at']),
+                                                'removed',
+                                                (int) ($item['procurement_status'] === \App\Services\QuotationPricingService::REMOVED_FROM_QUOTATION),
+                                            ]);
+                                        }
+
+                                        return 'line:' . ($item['id'] ?? uniqid('', true));
+                                    })
+                                    ->map(function ($group) {
+                                        $item = $group->first();
+                                        $quantity = (float) $group->sum(fn ($line) => (float) $line['qty']);
+                                        $amount = (float) $group->sum(fn ($line) => (float) $line['qty'] * (float) $line['unit_price']);
+
+                                        $item['qty'] = $quantity;
+                                        $item['unit_price'] = $quantity > 0 ? $amount / $quantity : (float) $item['unit_price'];
+                                        $item['source_booking_item_ids'] = $group->pluck('source_booking_item_ids')->flatten()->unique()->values()->all();
+                                        $item['source_count'] = count($item['source_booking_item_ids']);
+                                        $item['duplicate'] = $item['source_count'] === 1 && $item['duplicate'];
+
+                                        return $item;
+                                    })
+                                    ->values()
+                                    ->all();
                             @endphp
 
                             @php
@@ -949,8 +1007,13 @@
                             @endphp
                             @forelse($itemsToDisplay as $idx => $item)
                                 @php
+                                    $typedLinesForItem = collect($item['source_booking_item_ids'] ?? [(int) ($item['id'] ?? 0)])
+                                        ->map(fn ($sourceId) => $typedLines->get((string) $sourceId))
+                                        ->filter(fn ($line) => is_array($line) && is_numeric($line['quantity'] ?? null));
                                     $typedLine = !empty($item['id']) ? $typedLines->get((string) $item['id']) : null;
-                                    $shownQty = (is_array($typedLine) && is_numeric($typedLine['quantity'] ?? null)) ? $typedLine['quantity'] : $item['qty'];
+                                    $shownQty = $typedLinesForItem->isNotEmpty()
+                                        ? $typedLinesForItem->sum(fn ($line) => (float) $line['quantity'])
+                                        : $item['qty'];
                                     $shownPrice = (is_array($typedLine) && is_numeric($typedLine['unit_price'] ?? null)) ? $typedLine['unit_price'] : $item['unit_price'];
                                     $invData = isset($allInventoryItems) ? $allInventoryItems->firstWhere('name', $item['name']) : null;
                                     $isOutOfStock = $invData ? ($item['qty'] > $invData->current_stock) : false;
@@ -966,7 +1029,9 @@
                                     <td class="py-3 pl-5 pr-4" data-label="Item Name">
                                         <span class="block font-medium text-slate-900" id="display_name_{{ $idx }}">{{ $item['name'] }}</span>
                                         <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
-                                            @if(!empty($item['duplicate']))
+                                            @if(($item['source_count'] ?? 1) > 1)
+                                                <span class="{{ $pill }} bg-sky-100 text-sky-800" title="Lines linked to the same inventory item are combined here. Their source booking lines remain separate.">Combined {{ $item['source_count'] }} lines</span>
+                                            @elseif(!empty($item['duplicate']))
                                                 <span class="{{ $pill }} bg-sky-100 text-sky-800" title="Another line above has the same name (e.g. suggested for a second photo or area). Both are quoted: price both, or tick Remove on one.">Listed twice</span>
                                             @endif
                                             @if($isUnmatchedSuggestion)
@@ -999,6 +1064,11 @@
                                         <input type="hidden" name="items[{{ $idx }}][is_ai_suggested]" value="{{ !empty($item['is_ai_suggested']) ? '1' : '0' }}">
                                         @if(!empty($item['id']))
                                             <input type="hidden" name="items[{{ $idx }}][booking_item_id]" value="{{ $item['id'] }}">
+                                            @if(($item['source_count'] ?? 1) > 1)
+                                                @foreach($item['source_booking_item_ids'] as $sourceBookingItemId)
+                                                    <input type="hidden" name="items[{{ $idx }}][source_booking_item_ids][]" value="{{ $sourceBookingItemId }}">
+                                                @endforeach
+                                            @endif
                                         @endif
                                     </td>
                                     <td class="px-4 py-3" data-label="Qty">
@@ -1265,6 +1335,7 @@
                         <input type="hidden" name="unit_price" data-ai-row-field="unit_price">
                     @endif
                     <input type="hidden" name="catalog_name" id="aiPromoteName_{{ $idx }}">
+                    <input type="hidden" name="confirm_distinct_catalog_item" id="aiPromoteDistinct_{{ $idx }}" value="0">
                     <input type="hidden" name="category" id="aiPromoteCategory_{{ $idx }}">
                     <input type="hidden" name="unit" id="aiPromoteUnit_{{ $idx }}">
                     <input type="hidden" name="is_perishable" id="aiPromotePerishable_{{ $idx }}" value="1">
@@ -1278,9 +1349,11 @@
                 <form id="confirmMaterial_{{ $idx }}" method="POST" action="{{ route('admin.bookings.items.confirm', ['booking' => $booking->id, 'bookingItem' => $item['id']]) }}" class="hidden">
                     @csrf
                     @unless($quoteReadOnly)
-                        {{-- Kept in step with the row by syncConfirmLineValues(); saved with the confirmation. --}}
-                        <input type="hidden" name="quantity" value="{{ (int) $item['qty'] }}" data-sync-item="{{ $item['id'] }}" data-sync-field="quantity">
-                        <input type="hidden" name="unit_price" value="{{ number_format((float) $item['unit_price'], 2, '.', '') }}" data-sync-item="{{ $item['id'] }}" data-sync-field="unit_price">
+                        @foreach($item['source_booking_item_ids'] as $sourceBookingItemId)
+                            <input type="hidden" name="booking_item_ids[]" value="{{ $sourceBookingItemId }}">
+                        @endforeach
+                        <input type="hidden" name="quantity" value="{{ (int) $item['qty'] }}" data-sync-group-row="{{ $idx }}" data-sync-field="quantity">
+                        <input type="hidden" name="unit_price" value="{{ number_format((float) $item['unit_price'], 2, '.', '') }}" data-sync-group-row="{{ $idx }}" data-sync-field="unit_price">
                     @endunless
                 </form>
             @endif
@@ -1476,10 +1549,18 @@
     {{-- ============================== PREPARATION ============================== --}}
     <div id="tab-preparation" class="tab-content hidden space-y-6" role="tabpanel" aria-labelledby="tab-preparation-button" tabindex="0">
         @php
-            $isPrepDateValid = !is_null($booking->preparation_start_date) && !$booking->preparation_start_date->isFuture();
-            $canReserve = in_array($booking->status, ['downpayment_received', 'confirmed', 'in_preparation'], true) && $isPrepDateValid;
-            $hasFreshFlowers = $booking->bookingItems()->whereHas('inventoryItem', fn ($q) => $q->where('is_perishable', true))->exists();
+            $operationalPaymentVerified = $booking->hasVerifiedPayment();
+            $isPrepDateValid = $booking->isPreparationDateWithinEventWindow();
+            $hasValidPreparationSchedule = $booking->hasValidPreparationSchedule();
+            $operationalStatusAllowed = in_array($booking->status, ['downpayment_received', 'confirmed', 'fully_paid', 'in_preparation', 'event_in_progress'], true);
+            $canManagePreparation = $operationalPaymentVerified && $operationalStatusAllowed && $hasValidPreparationSchedule;
+            $canReserve = $canManagePreparation;
+            $freshFlowerItems = ($bookingItems ?? $booking->bookingItems)->filter(fn ($item) => $item->requiresFreshProcurement() && $item->confirmed_at && (float) $item->quantity > 0)->values();
+            $hasFreshFlowers = $freshFlowerItems->isNotEmpty();
             $freshFlowersReady = $hasFreshFlowers && $booking->areFreshFlowersReady();
+            $prepMinDate = now()->toDateString();
+            $prepMaxDate = $booking->event_date?->copy()->subDays(14)->toDateString();
+            $prepWindowAvailable = $prepMaxDate !== null && $prepMaxDate >= $prepMinDate;
 
             // Mirrors InventoryDispatchService: outstanding = reserved (lock - release) - net dispatched, per inventory item.
             $dispatchClosed = in_array($booking->status, ['event_completed', 'completed', 'cancelled', 'declined', 'rejected', 'pending_return', 'pending_resolution'], true);
@@ -1504,7 +1585,7 @@
                 ->filter(fn ($row) => $row['reserved'] > 0 || $row['dispatched'] > 0)
                 ->values();
             $hasOutstanding = $dispatchRows->contains(fn ($row) => $row['outstanding'] > 0);
-            $canDispatch = !$dispatchClosed && !is_null($booking->confirmed_at) && $hasOutstanding;
+            $canDispatch = !$dispatchClosed && $canManagePreparation && !is_null($booking->confirmed_at) && $hasOutstanding;
             $fullyDispatched = $dispatchRows->isNotEmpty() && !$hasOutstanding;
             $formatQty = fn ($qty) => rtrim(rtrim(number_format((float) $qty, 2, '.', ','), '0'), '.');
 
@@ -1517,9 +1598,19 @@
             <div class="{{ $cardHeader }}">
                 <div>
                     <h2 id="preparation-heading" class="{{ $cardTitle }}">Operational Preparation &amp; Dispatch</h2>
-                    <p class="{{ $cardText }}">Work through each step in order. Steps unlock as the booking is confirmed and paid.</p>
+                    <p class="{{ $cardText }}">Operations unlock after payment is verified and a valid preparation date is saved.</p>
                 </div>
             </div>
+
+            @if(!$operationalPaymentVerified)
+                <p class="mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
+                    <i class="fa-solid fa-lock mr-1" aria-hidden="true"></i>Operational preparation and dispatch are locked until a down payment or full payment is verified.
+                </p>
+            @elseif(!$prepWindowAvailable)
+                <p class="mx-5 mt-5 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-800">
+                    No valid preparation dates remain. Preparation must start at least 14 days before the event. Review the event schedule with the client.
+                </p>
+            @endif
 
             <ol class="p-5" role="list">
                 <!-- 1. Preparation Scheduling -->
@@ -1537,7 +1628,7 @@
                                 <span class="{{ $pill }} bg-slate-100 text-slate-600">Not scheduled</span>
                             @endif
                         </div>
-                        <p class="mt-1 text-[13px] text-slate-500">Set the date when material reservation and preparation should begin. This is under Admin control and must not be after the event date.</p>
+                        <p class="mt-1 text-[13px] text-slate-500">Set the date when material reservation and preparation should begin. Choose today or later, and at least 14 days before the event.</p>
 
                         <form method="POST" action="{{ route('admin.bookings.update', $booking) }}" class="mt-3 flex flex-wrap items-center gap-2">
                             @csrf
@@ -1548,10 +1639,13 @@
                             <input type="hidden" name="venue" value="{{ $booking->venue }}">
 
                             <label for="preparation_start_date" class="sr-only">Preparation start date</label>
-                            <input id="preparation_start_date" type="date" name="preparation_start_date" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-brand-600 focus:ring-2 focus:ring-brand-500/20 focus:outline-none" value="{{ optional($booking->preparation_start_date)->format('Y-m-d') }}" max="{{ optional($booking->event_date)->format('Y-m-d') }}" required>
+                            <input id="preparation_start_date" type="date" name="preparation_start_date" min="{{ $prepMinDate }}" max="{{ $prepMaxDate }}" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-brand-600 focus:ring-2 focus:ring-brand-500/20 focus:outline-none" value="{{ optional($booking->preparation_start_date)->format('Y-m-d') }}" required {{ !$operationalPaymentVerified || !$prepWindowAvailable ? 'disabled' : '' }}>
 
-                            <button type="submit" class="{{ $btnDark }}">Save Date</button>
+                            <button type="submit" class="{{ $btnDark }}" {{ !$operationalPaymentVerified || !$prepWindowAvailable ? 'disabled' : '' }}>Save Date</button>
                         </form>
+                        @error('preparation_start_date')
+                            <p class="mt-2 text-xs font-medium text-rose-700">{{ $message }}</p>
+                        @enderror
                     </div>
                 </li>
 
@@ -1570,15 +1664,19 @@
                                 <span class="{{ $pill }} bg-slate-100 text-slate-600"><i class="fa-solid fa-lock" aria-hidden="true"></i>Locked</span>
                             @endif
                         </div>
-                        <p class="mt-1 text-[13px] text-slate-500">Lock the required reusable materials for this event. Requires a valid preparation start date that has been reached.</p>
+                        <p class="mt-1 text-[13px] text-slate-500">Lock reusable materials after payment is verified and a valid preparation date is saved. The date records when preparation is planned; it does not delay reservation.</p>
 
                         <form method="POST" action="{{ route('admin.bookings.reserve-materials', $booking) }}" class="mt-3">
                             @csrf
                             <button type="submit" class="{{ $btnPrimary }}" {{ !$canReserve ? 'disabled' : '' }}>
                                 <i class="fa-solid fa-lock" aria-hidden="true"></i>Reserve Materials
                             </button>
-                            @if(!$isPrepDateValid)
-                                <p class="mt-2 flex items-center gap-1.5 text-xs font-medium text-amber-700"><i class="fa-solid fa-circle-info" aria-hidden="true"></i>Cannot reserve: Preparation start date is missing or in the future.</p>
+                            @if(!$operationalPaymentVerified)
+                                <p class="mt-2 flex items-center gap-1.5 text-xs font-medium text-amber-700"><i class="fa-solid fa-circle-info" aria-hidden="true"></i>Cannot reserve: verified payment is required first.</p>
+                            @elseif(!$isPrepDateValid)
+                                <p class="mt-2 flex items-center gap-1.5 text-xs font-medium text-amber-700"><i class="fa-solid fa-circle-info" aria-hidden="true"></i>Cannot reserve: choose a valid preparation date from today through at least 14 days before the event.</p>
+                            @elseif($booking->preparation_start_date->isFuture())
+                                <p class="mt-2 flex items-center gap-1.5 text-xs font-medium text-emerald-700"><i class="fa-solid fa-circle-info" aria-hidden="true"></i>Reservation can be started now. Preparation is planned for {{ $booking->preparation_start_date->format('M j, Y') }}.</p>
                             @endif
                         </form>
                     </div>
@@ -1593,14 +1691,41 @@
                         </span>
                         <div class="min-w-0 flex-1">
                             <h3 class="text-sm font-semibold text-slate-900">3. Fresh Flower Procurement</h3>
-                            <p class="mt-1 text-[13px] text-slate-500">Confirm that all required fresh flowers and perishable items have been procured and are ready for the event.</p>
+                            <p class="mt-1 text-[13px] text-slate-500">Review the fresh items below. You can correct an item that belongs with reusable inventory without removing it from the booking.</p>
+
+                            <ul class="mt-3 space-y-2" role="list">
+                                @foreach($freshFlowerItems as $freshItem)
+                                    @php
+                                        $freshItemInventory = $freshItem->inventoryItem;
+                                        $hasItemLedger = $freshItemInventory && \App\Models\InventoryTransaction::where('booking_id', $booking->id)->where('inventory_item_id', $freshItemInventory->id)->exists();
+                                    @endphp
+                                    <li class="flex flex-col gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                                        <div class="min-w-0">
+                                            <p class="truncate text-sm font-medium text-slate-800">{{ $freshItem->item_name ?? $freshItemInventory?->name ?? 'Unlinked item' }} <span class="font-normal text-slate-600">— {{ $formatMaterialQty($freshItem->quantity) }}</span></p>
+                                            <p class="text-xs text-slate-500">Procurement: {{ ucfirst($freshItem->procurement_status ?? 'pending') }}</p>
+                                        </div>
+                                        @if($freshItemInventory)
+                                            <form method="POST" action="{{ route('admin.bookings.items.fresh-procurement', [$booking, $freshItem]) }}" class="shrink-0">
+                                                @csrf
+                                                <input type="hidden" name="fresh_procurement" value="0">
+                                                <button type="submit" class="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50" {{ !$canManagePreparation || $hasItemLedger ? 'disabled' : '' }}>
+                                                    Treat as reusable inventory
+                                                </button>
+                                            </form>
+                                        @endif
+                                    </li>
+                                @endforeach
+                            </ul>
 
                             <form method="POST" action="{{ route('admin.bookings.confirm-fresh-flowers', $booking) }}" class="mt-3">
                                 @csrf
-                                <button type="submit" class="{{ $freshFlowersReady ? $btnSecondary : $btnPrimary }}" {{ $booking->areFreshFlowersReady() ? 'disabled' : '' }}>
+                                <button type="submit" class="{{ $freshFlowersReady ? $btnSecondary : $btnPrimary }}" {{ !$canManagePreparation || $freshFlowersReady ? 'disabled' : '' }}>
                                     <i class="fa-solid fa-seedling" aria-hidden="true"></i>{{ $booking->areFreshFlowersReady() ? 'Fresh Flowers Confirmed' : 'Confirm Fresh Flowers' }}
                                 </button>
                             </form>
+                            @if(!$canManagePreparation)
+                                <p class="mt-2 text-xs font-medium text-amber-700">{{ !$operationalPaymentVerified ? 'Payment must be verified before confirming procurement.' : 'Set a valid preparation date before confirming procurement.' }}</p>
+                            @endif
                         </div>
                     </li>
                 @endif
@@ -1683,6 +1808,10 @@
                                     </button>
                                 @elseif($dispatchClosed)
                                     <p class="text-sm font-medium text-slate-600"><i class="fa-solid fa-lock mr-1" aria-hidden="true"></i>Dispatch unavailable — this booking is {{ strtolower($booking->status_display_label) }}.</p>
+                                @elseif(!$operationalPaymentVerified)
+                                    <p class="text-sm font-medium text-amber-700">Dispatch unavailable — verified payment is required.</p>
+                                @elseif(!$hasValidPreparationSchedule)
+                                    <p class="text-sm font-medium text-amber-700">Dispatch unavailable — schedule a valid preparation start date first.</p>
                                 @elseif(is_null($booking->confirmed_at))
                                     <p class="text-sm font-medium text-amber-700">Dispatch unavailable — the booking confirmation date is not recorded.</p>
                                 @else
@@ -2050,11 +2179,20 @@
                     ])->values();
                 @endphp
                 <script type="application/json" id="aiMaterialInventoryData">@json($inventoryForLink)</script>
+                <script type="application/json" id="aiMaterialSimilarityData">@json($catalogSimilarityItems->map(fn ($item) => ['name' => $item->name, 'archived' => $item->trashed()])->values())</script>
             </div>
             <div id="aiMaterialPromoteFields" class="mt-5 hidden space-y-3">
                 <div>
                     <label for="aiMaterialCatalogName" class="{{ $fieldLabel }}">Catalog name <span class="text-rose-600">*</span></label>
                     <input id="aiMaterialCatalogName" type="text" class="{{ $fieldInput }}" required>
+                </div>
+                <div id="aiMaterialDuplicateReview" class="hidden rounded-lg border border-amber-300 bg-amber-50 p-3">
+                    <p class="text-xs font-semibold text-amber-900">Possible catalog matches — review before creating</p>
+                    <ul id="aiMaterialDuplicateCandidates" class="mt-1 list-disc pl-5 text-xs text-amber-800"></ul>
+                    <label class="mt-2 flex items-start gap-2 text-xs text-amber-900">
+                        <input id="aiMaterialConfirmDistinct" type="checkbox" class="mt-0.5 rounded border-amber-400 text-brand-700 focus:ring-brand-500">
+                        <span>I reviewed these matches and confirm this is a genuinely different item.</span>
+                    </label>
                 </div>
                 <div class="grid gap-3 sm:grid-cols-2">
                     <div>
@@ -2317,12 +2455,14 @@
             const description = document.getElementById('aiMaterialModalDescription');
             const error = document.getElementById('aiMaterialModalError');
             error.classList.add('hidden');
+            document.getElementById('aiMaterialConfirmDistinct').checked = false;
             linkFields.classList.toggle('hidden', mode !== 'link');
             promoteFields.classList.toggle('hidden', mode !== 'promote');
             const itemName = document.getElementById(`display_name_${index}`)?.textContent.trim() || '';
             if (mode === 'promote') {
                 // Start from the item's own name; Admin can still edit it.
                 document.getElementById('aiMaterialCatalogName').value = itemName;
+                renderCatalogDuplicateReview();
             } else {
                 // Start the search from the item's own name; Admin picks the right record.
                 document.getElementById('aiMaterialInventorySearch').value = itemName;
@@ -2341,10 +2481,56 @@
         // name first (case, spacing and punctuation ignored), then singular/plural, then names
         // containing every typed word, then names sharing a word.
         const inventoryForLink = JSON.parse(document.getElementById('aiMaterialInventoryData')?.textContent || '[]');
+        const catalogSimilarityItems = JSON.parse(document.getElementById('aiMaterialSimilarityData')?.textContent || '[]');
         const nameKey = (text) => String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
         const singularKey = (text) => nameKey(text).split(' ').map((word) => (word.length <= 3 || /(ss|us|is)$/.test(word))
             ? word
             : word.replace(/ies$/, 'y').replace(/(sh|ch|x|z)es$/, '$1').replace(/s$/, '')).join(' ');
+        const editDistance = (first, second) => {
+            const row = Array.from({ length: second.length + 1 }, (_, index) => index);
+            for (let i = 1; i <= first.length; i++) {
+                let diagonal = row[0];
+                row[0] = i;
+                for (let j = 1; j <= second.length; j++) {
+                    const previous = row[j];
+                    row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (first[i - 1] === second[j - 1] ? 0 : 1));
+                    diagonal = previous;
+                }
+            }
+            return row[second.length];
+        };
+
+        function possibleCatalogMatches(name) {
+            const typed = singularKey(name).split(' ').filter(Boolean);
+            if (!typed.length) return [];
+            const sortedTyped = typed.slice().sort().join(' ');
+            return catalogSimilarityItems.map((item) => {
+                const words = singularKey(item.name).split(' ').filter(Boolean);
+                const sortedWords = words.slice().sort().join(' ');
+                const overlap = new Set(typed.filter((word) => words.includes(word))).size / Math.max(typed.length, words.length);
+                const spelling = 1 - editDistance(sortedTyped, sortedWords) / Math.max(sortedTyped.length, sortedWords.length, 1);
+                return { ...item, score: Math.max(overlap, spelling), key: sortedWords };
+            }).filter((item) => item.score >= 0.68 && item.key !== sortedTyped)
+                .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+                .slice(0, 5);
+        }
+
+        function renderCatalogDuplicateReview() {
+            const matches = possibleCatalogMatches(document.getElementById('aiMaterialCatalogName').value);
+            const panel = document.getElementById('aiMaterialDuplicateReview');
+            const list = document.getElementById('aiMaterialDuplicateCandidates');
+            const confirm = document.getElementById('aiMaterialConfirmDistinct');
+            list.replaceChildren(...matches.map((item) => {
+                const row = document.createElement('li');
+                row.textContent = item.name + (item.archived ? ' (archived)' : '');
+                return row;
+            }));
+            panel.classList.toggle('hidden', matches.length === 0);
+            if (!matches.length) confirm.checked = false;
+            return matches;
+        }
+
+        document.getElementById('aiMaterialCatalogName')?.addEventListener('input', renderCatalogDuplicateReview);
 
         function inventoryMatchScore(item, query) {
             const key = nameKey(item.name);
@@ -2475,7 +2661,13 @@
                 error.classList.remove('hidden');
                 return;
             }
+            if (possibleCatalogMatches(catalogName).length > 0 && !document.getElementById('aiMaterialConfirmDistinct').checked) {
+                error.textContent = 'Review the possible catalog matches. Link the existing item, or confirm below if this is genuinely different.';
+                error.classList.remove('hidden');
+                return;
+            }
             document.getElementById(`aiPromoteName_${index}`).value = catalogName;
+            document.getElementById(`aiPromoteDistinct_${index}`).value = document.getElementById('aiMaterialConfirmDistinct').checked ? '1' : '0';
             document.getElementById(`aiPromoteCategory_${index}`).value = document.getElementById('aiMaterialCategory').value.trim();
             document.getElementById(`aiPromoteUnit_${index}`).value = document.getElementById('aiMaterialUnit').value.trim();
             document.getElementById(`aiPromotePerishable_${index}`).value = document.getElementById('aiMaterialPerishable').checked ? '1' : '0';
@@ -2642,11 +2834,52 @@
                 const match = hidden.name.match(/^items\[(\d+)\]/);
                 if (match) rowIndexByItem[hidden.value] = match[1];
             });
+            document.querySelectorAll('tr[id^="row_"] input[name$="[source_booking_item_ids][]"]').forEach((hidden) => {
+                const match = hidden.name.match(/^items\[(\d+)\]/);
+                if (match) rowIndexByItem[hidden.value] = match[1];
+            });
+
+            document.querySelectorAll('input[data-sync-group-row]').forEach((hidden) => {
+                const rowIndex = hidden.dataset.syncGroupRow;
+                const source = document.getElementById((hidden.dataset.syncField === 'quantity' ? 'input_qty_' : 'input_price_') + rowIndex);
+                if (source && !source.disabled) hidden.value = source.value;
+            });
+
+            const groupedValues = new Map();
             document.querySelectorAll('input[data-sync-item]').forEach((hidden) => {
                 const rowIndex = rowIndexByItem[hidden.dataset.syncItem];
                 if (rowIndex === undefined) return;
-                const source = document.getElementById((hidden.dataset.syncField === 'quantity' ? 'input_qty_' : 'input_price_') + rowIndex);
-                if (source && !source.disabled) hidden.value = source.value;
+                const values = groupedValues.get(rowIndex) || [];
+                values.push(hidden);
+                groupedValues.set(rowIndex, values);
+            });
+            groupedValues.forEach((fields, rowIndex) => {
+                const quantityInput = document.getElementById('input_qty_' + rowIndex);
+                const priceInput = document.getElementById('input_price_' + rowIndex);
+                if (!quantityInput || !priceInput || quantityInput.disabled || priceInput.disabled) return;
+
+                const quantityFields = fields.filter((field) => field.dataset.syncField === 'quantity');
+                const totalQuantity = Number(quantityInput.value);
+                const totalWeight = quantityFields.reduce((sum, field) => sum + Number(field.dataset.originalQuantity || 0), 0);
+                let remaining = totalQuantity;
+                quantityFields.forEach((field, index) => {
+                    const share = index === quantityFields.length - 1
+                        ? remaining
+                        : (totalWeight > 0
+                            ? Math.floor(totalQuantity * Number(field.dataset.originalQuantity || 0) / totalWeight)
+                            : Math.floor(totalQuantity / quantityFields.length));
+                    field.value = String(share);
+                    remaining -= share;
+                });
+
+                const originalAmount = quantityFields.reduce((sum, field) => (
+                    sum + Number(field.dataset.originalQuantity || 0) * Number(field.dataset.originalPrice || 0)
+                ), 0);
+                const originalAverage = totalWeight > 0 ? originalAmount / totalWeight : null;
+                if (originalAverage === null || Number(priceInput.value).toFixed(2) !== originalAverage.toFixed(2)) {
+                    fields.filter((field) => field.dataset.syncField === 'unit_price')
+                        .forEach((field) => { field.value = priceInput.value; });
+                }
             });
         }
 

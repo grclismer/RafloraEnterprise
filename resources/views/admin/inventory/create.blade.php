@@ -78,6 +78,10 @@
                             class="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs font-medium text-slate-800 focus:ring-2 focus:ring-brand-500 focus:border-brand-600 shadow-2xs transition"
                         >
                         @error('name') <p class="text-rose-600 text-xs mt-1">{{ $message }}</p> @enderror
+                        <label class="mt-2 inline-flex items-start gap-2 text-xs text-amber-800">
+                            <input type="checkbox" name="confirm_distinct_catalog_item" value="1" @checked(old('confirm_distinct_catalog_item')) class="mt-0.5 rounded border-amber-400 text-brand-700 focus:ring-brand-500">
+                            <span>I reviewed the possible catalog matches and confirm this is a genuinely different item.</span>
+                        </label>
                     </div>
 
                     <!-- Item Code (Auto-generated & Locked) -->

@@ -37,7 +37,8 @@ class BookingStatusChanged extends Mailable
             'quotation_sent' => 'Your quotation is ready',
             'payment_pending' => 'Booking accepted — payment is pending',
             'note_sent' => 'A new note from Raflora Enterprises',
-            default => 'Booking status update',
+            'proposal_uploaded' => 'A new proposal for your booking',
+            default => \App\Services\ClientStatusNotifier::content($this->status)[0],
         };
 
         return $this->subject($subject)

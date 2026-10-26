@@ -275,14 +275,72 @@ class InventoryItem extends Model
     }
 
     /**
-     * Existing catalog items (archived included) that a new item called $name would duplicate:
-     * 'exact' has the same words in any order (wordKey(); an active item is preferred over an
-     * archived one); 'similar' differs only by singular/plural. Used by every path that adds
-     * catalog items, so the same material is never added twice.
+     * Known quantity and form variants that represent the same catalog material.
+     * Keep this list narrow: different floral-foam shapes and finished arrangements
+     * must remain distinct inventory items.
+     */
+    public static function materialIdentityKey(?string $name): string
+    {
+        $key = self::singularNameKey($name);
+
+        if (preg_match('/^(?:\d+\s+)?floral foam(?:\s+(?:block|brick|oasis))?$/', $key)) {
+            return 'floral foam';
+        }
+
+        if (preg_match('/^(?:\d+\s+)?(white|red)\s+rose(?:\s+centerpiece)?$/', $key, $matches)) {
+            return $matches[1] . ' rose';
+        }
+
+        return '';
+    }
+
+    /**
+     * Likely spelling and word-order variants that need a human review before creating a new item.
+     *
+     * @return \Illuminate\Support\Collection<int, self>
+     */
+    public static function catalogSimilarityCandidates(string $name, ?int $ignoreId = null): \Illuminate\Support\Collection
+    {
+        $candidateKey = self::singularNameKey($name);
+        $candidateWords = array_values(array_filter(explode(' ', $candidateKey)));
+        if ($candidateKey === '' || $candidateWords === []) {
+            return collect();
+        }
+
+        return self::withTrashed()
+            ->when($ignoreId, fn ($query) => $query->whereKeyNot($ignoreId))
+            ->get()
+            ->map(function (self $item) use ($candidateKey, $candidateWords): array {
+                $itemKey = self::singularNameKey($item->name);
+                $itemWords = array_values(array_filter(explode(' ', $itemKey)));
+                $sharedWords = count(array_intersect($candidateWords, $itemWords));
+                $wordOverlap = $sharedWords / max(count($candidateWords), count($itemWords));
+                $candidateSorted = $candidateWords;
+                $itemSorted = $itemWords;
+                sort($candidateSorted);
+                sort($itemSorted);
+                $sortedKey = implode(' ', $candidateSorted);
+                $sortedItemKey = implode(' ', $itemSorted);
+                $distance = levenshtein($sortedKey, $sortedItemKey);
+                $similarity = 1 - ($distance / max(strlen($sortedKey), strlen($sortedItemKey), 1));
+
+                return ['item' => $item, 'score' => max($wordOverlap, $similarity)];
+            })
+            ->filter(fn (array $match): bool => $match['score'] >= 0.68)
+            ->sortByDesc('score')
+            ->take(5)
+            ->pluck('item')
+            ->values();
+    }
+
+    /**
+     * Existing catalog items (archived included) that a new item called $name would duplicate.
+     * Known quantity/form variants are matched to their canonical product, but are returned as
+     * 'similar' rather than 'exact' when a supplied unit conflicts with the canonical item's unit.
      *
      * @return array{exact: ?self, similar: ?self}
      */
-    public static function catalogMatches(string $name, ?int $ignoreId = null): array
+    public static function catalogMatches(string $name, ?int $ignoreId = null, ?string $unit = null): array
     {
         $key = self::wordKey($name);
         $singular = self::singularWordKey($name);
@@ -292,14 +350,46 @@ class InventoryItem extends Model
 
         $candidates = self::withTrashed()
             ->when($ignoreId, fn ($query) => $query->whereKeyNot($ignoreId))
-            ->get(['id', 'name', 'item_code', 'deleted_at'])
+            ->get(['id', 'name', 'item_code', 'unit', 'deleted_at'])
             ->sortBy(fn (self $item) => $item->deleted_at ? 1 : 0)
             ->values();
 
+        $identityKey = self::materialIdentityKey($name);
+        if ($identityKey !== '') {
+            $identityCandidates = $candidates->filter(
+                fn (self $item) => self::materialIdentityKey($item->name) === $identityKey
+            );
+            $canonical = $identityCandidates->first(
+                fn (self $item) => self::singularNameKey($item->name) === $identityKey
+            );
+            $match = $canonical ?? $identityCandidates->first();
+            $isVariantName = self::singularNameKey($name) !== $identityKey;
+
+            if ($match) {
+                if ($isVariantName && $unit !== null && !self::unitsMatch($match->unit, $unit)) {
+                    return ['exact' => null, 'similar' => $match];
+                }
+
+                return ['exact' => $match, 'similar' => null];
+            }
+        }
+
+        $exact = $candidates->first(fn (self $item) => self::wordKey($item->name) === $key);
         return [
-            'exact' => $candidates->first(fn (self $item) => self::wordKey($item->name) === $key),
+            'exact' => $exact,
             'similar' => $candidates->first(fn (self $item) => self::singularWordKey($item->name) === $singular),
         ];
+    }
+
+    private static function unitsMatch(?string $first, ?string $second): bool
+    {
+        $normalize = static function (?string $unit): string {
+            $key = self::singularNameKey($unit);
+
+            return in_array($key, ['pc', 'pcs', 'piece', 'unit'], true) ? 'piece' : $key;
+        };
+
+        return $normalize($first) === $normalize($second);
     }
 
     public function getAvailableStockAttribute(): float

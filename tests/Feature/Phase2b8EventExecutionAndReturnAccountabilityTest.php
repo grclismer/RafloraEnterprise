@@ -580,7 +580,8 @@ class Phase2b8EventExecutionAndReturnAccountabilityTest extends TestCase
         $booking = Booking::create([
             'client_id' => $this->clientRecord->id,
             'event_type' => 'anniversary',
-            'event_date' => now()->addDays(2)->toDateString(),
+            'event_date' => now()->addDays(30)->toDateString(),
+            'preparation_start_date' => now()->toDateString(),
             'venue' => 'Sunset Terrace',
             'status' => 'confirmed',
             'preparation_status' => 'ready', // Generic ready status does NOT bypass fresh flower readiness
@@ -596,6 +597,15 @@ class Phase2b8EventExecutionAndReturnAccountabilityTest extends TestCase
             'quantity' => 15,
             'confirmed_at' => now(),
             'procurement_status' => 'pending', // Not confirmed yet
+        ]);
+        Payment::create([
+            'booking_id' => $booking->id,
+            'amount' => 100,
+            'payment_type' => 'bank_transfer',
+            'payment_option' => 'downpayment',
+            'reference_number' => 'VERIFIED-' . uniqid(),
+            'status' => 'downpayment_received',
+            'verified_at' => now(),
         ]);
 
         // Attempt to mark event in progress before Admin explicitly confirms fresh flowers

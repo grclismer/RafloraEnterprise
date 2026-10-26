@@ -1334,6 +1334,10 @@
                                 placeholder="e.g. Pink Rose (Fresh)"
                                 class="w-full px-3.5 py-2 bg-white border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:ring-2 focus:ring-brand-500 focus:border-brand-600 transition shadow-2xs"
                             >
+                            <label class="mt-2 inline-flex items-start gap-2 text-xs text-amber-800">
+                                <input type="checkbox" name="confirm_distinct_catalog_item" value="1" class="mt-0.5 rounded border-amber-400 text-brand-700 focus:ring-brand-500">
+                                <span>I reviewed the possible catalog matches and confirm this is a genuinely different item.</span>
+                            </label>
                         </div>
 
                         <!-- Item Code (Auto-generated & Locked) -->

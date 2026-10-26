@@ -33,6 +33,14 @@ class InventoryDispatchService
             throw new \LogicException("Booking #{$booking->id} cannot dispatch items while it is {$booking->status_display_label}.");
         }
 
+        if (!$booking->hasVerifiedPayment()) {
+            throw new \LogicException('Cannot dispatch materials until a down payment or full payment has been verified.');
+        }
+
+        if (!$booking->hasValidPreparationSchedule()) {
+            throw new \LogicException('Cannot dispatch materials until a valid preparation start date is scheduled.');
+        }
+
         DB::transaction(function () use ($booking, $dispatchItems, $performedByUserId, $adminReason) {
             // Lock the booking to prevent concurrent modifications
             $lockedBooking = Booking::where('id', $booking->id)->lockForUpdate()->firstOrFail();
@@ -44,6 +52,11 @@ class InventoryDispatchService
             $lockedItems = !empty($itemIds)
                 ? InventoryItem::whereIn('id', $itemIds)->orderBy('id')->lockForUpdate()->get()->keyBy('id')
                 : collect();
+
+            $reusableIds = $lockedBooking->reusableBookingItems()
+                ->pluck('inventory_item_id')
+                ->map(fn ($id) => (int) $id)
+                ->unique();
 
             foreach ($dispatchItems as $dispatchReq) {
                 $itemId = $dispatchReq['inventory_item_id'];
@@ -61,6 +74,10 @@ class InventoryDispatchService
                 }
 
                 $item = $lockedItems->get($itemId);
+
+                if (!$reusableIds->contains((int) $itemId)) {
+                    throw new \LogicException("\"{$item->name}\" is not classified as reusable inventory for this booking.");
+                }
 
                 // 2. Validate Reservation and Outstanding Quantity
                 // Outstanding = still held for this booking: locks - releases - net dispatch
@@ -290,4 +307,3 @@ class InventoryDispatchService
         });
     }
 }
-

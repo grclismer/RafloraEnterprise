@@ -26,9 +26,14 @@
                 <p><strong>Reference:</strong> {{ $payment->reference_number }}</p>
                 <p><strong>Amount:</strong> ₱{{ number_format($payment->amount ?? 0, 2) }}</p>
             @endif
+        @elseif($status === 'proposal_uploaded')
+            <p>A new proposal was uploaded for your booking <strong>#{{ $booking->id }}</strong>. Please log in to review it.</p>
         @else
-            <p>Your booking status was updated to <strong>{{ ucfirst(str_replace('_',' ',$status)) }}</strong>.</p>
+            <p>Your booking <strong>#{{ $booking->id }}</strong> for <strong>{{ $booking->event_type }}</strong>@if($booking->event_date) on <strong>{{ $booking->event_date->format('F j, Y') }}</strong>@endif is now <strong>{{ (new \App\Models\Booking())->forceFill(['status' => $status])->client_status_label }}</strong>.</p>
+            <p>{{ \App\Services\ClientStatusNotifier::content($status)[1] }}</p>
         @endif
+
+        <p><a href="{{ route('client.booking.updates', $booking) }}" style="display:inline-block;background:#2d0b6b;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">View booking updates</a></p>
 
         <p>If you have questions, reply to this email.</p>
         <p style="color:#888;font-size:12px;margin-top:18px">Raflora Enterprises</p>

@@ -934,7 +934,7 @@ class BookingController extends Controller
                     continue;
                 }
 
-                ['exact' => $exact, 'similar' => $similar] = InventoryItem::catalogMatches($name);
+                ['exact' => $exact, 'similar' => $similar] = InventoryItem::catalogMatches($name, unit: 'piece');
                 if ($exact && !$exact->trashed()) {
                     $bookingItem->forceFill(['inventory_item_id' => $exact->id])->save();
                     $linked++;
@@ -944,6 +944,13 @@ class BookingController extends Controller
                     $skipped[] = $exact
                         ? "\"{$name}\" (\"{$exact->name}\" is archived: restore it first)"
                         : "\"{$name}\" (similar to \"{$similar->name}\": link it from the booking)";
+                    continue;
+                }
+
+                $possibleMatches = InventoryItem::catalogSimilarityCandidates($name);
+                if ($possibleMatches->isNotEmpty()) {
+                    $candidateNames = $possibleMatches->pluck('name')->implode(', ');
+                    $skipped[] = "\"{$name}\" (possible duplicate of: {$candidateNames}; review and link it from the booking)";
                     continue;
                 }
 
@@ -1184,8 +1191,8 @@ class BookingController extends Controller
         $unreadMessageCount = $bookingMessages->where('sender_type', 'client')->whereNull('read_at')->count();
 
         $confirmedItems = $bookingItems->filter(fn ($bi) => $bi->confirmed_at !== null && (float) $bi->quantity > 0);
-        $reusableItems = $confirmedItems->filter(fn ($bi) => $bi->inventoryItem && !$bi->inventoryItem->is_perishable);
-        $freshFlowerItems = $confirmedItems->filter(fn ($bi) => $bi->inventoryItem && $bi->inventoryItem->is_perishable);
+        $reusableItems = $confirmedItems->filter(fn ($bi) => $bi->inventoryItem && !$bi->requiresFreshProcurement());
+        $freshFlowerItems = $confirmedItems->filter(fn ($bi) => $bi->requiresFreshProcurement());
         $unconfirmedItems = $bookingItems->filter(fn ($bi) => $bi->confirmed_at === null && (float) $bi->quantity > 0);
 
         $bookingShortages = [];
@@ -1270,6 +1277,7 @@ class BookingController extends Controller
             'analysis' => $analysis,
             'payment' => $payment,
             'allInventoryItems' => $allInventoryItems,
+            'catalogSimilarityItems' => InventoryItem::withTrashed()->orderBy('name')->get(['id', 'name', 'deleted_at']),
             'staffUsers' => $staffUsers,
             'bookingItems' => $bookingItems,
             'isEditMode' => $isEditMode,
@@ -1335,7 +1343,7 @@ class BookingController extends Controller
      * Why $name cannot be added to the catalog, or null. Names are compared ignoring case, spacing
      * and punctuation, and singular/plural (InventoryItem::catalogMatches), archived items included.
      */
-    protected function duplicateCatalogNameError(string $name): ?string
+    protected function duplicateCatalogNameError(string $name, bool $confirmDistinct = false): ?string
     {
         ['exact' => $exact, 'similar' => $similar] = InventoryItem::catalogMatches($name);
 
@@ -1345,9 +1353,17 @@ class BookingController extends Controller
                 : "An inventory item named \"{$exact->name}\" already exists. Link the material to it instead of adding a duplicate.";
         }
 
-        return $similar
-            ? "A similar inventory item \"{$similar->name}\" already exists" . ($similar->trashed() ? ' (archived)' : '') . ". Link the material to it, or use a clearly different name."
-            : null;
+        if ($similar) {
+            return "A similar inventory item \"{$similar->name}\" already exists" . ($similar->trashed() ? ' (archived)' : '') . ". Link the material to it, or use a clearly different name.";
+        }
+
+        $possibleMatches = InventoryItem::catalogSimilarityCandidates($name);
+        if ($possibleMatches->isNotEmpty() && !$confirmDistinct) {
+            return 'Possible catalog matches: ' . $possibleMatches->pluck('name')->implode(', ')
+                . '. Review these items, link the correct one, or confirm that the new item is genuinely different.';
+        }
+
+        return null;
     }
 
     protected function adjustInventoryForBookingStatus(Booking $booking, ?string $oldStatus, ?string $newStatus): void
@@ -1359,9 +1375,8 @@ class BookingController extends Controller
         $confirmedStatuses = ['downpayment_received', 'confirmed'];
         $cancelledStatuses = ['cancelled', 'declined', 'rejected'];
 
-        if (in_array($newStatus, $confirmedStatuses, true)) {
-            // Delay reusable inventory reservation until the defined preparation period
-            if (is_null($booking->preparation_start_date) || $booking->preparation_start_date->isFuture()) {
+        if (in_array($newStatus, [...$confirmedStatuses, 'fully_paid'], true)) {
+            if (!$booking->hasVerifiedPayment() || !$booking->hasValidPreparationSchedule()) {
                 return;
             }
 
@@ -1376,7 +1391,8 @@ class BookingController extends Controller
     public function reserveReusableMaterialsForBooking(Booking $booking): array
     {
         $items = $this->confirmedInventoryItems($booking);
-        $reusableItems = $items->filter(fn ($item) => !$item->is_perishable);
+        $reusableIds = $booking->reusableBookingItems()->pluck('inventory_item_id')->map(fn ($id) => (int) $id)->unique();
+        $reusableItems = $items->filter(fn ($item) => $reusableIds->contains((int) $item->id));
 
         if ($reusableItems->isEmpty()) {
             return ['reserved' => 0, 'shortages' => []];
@@ -1467,16 +1483,16 @@ class BookingController extends Controller
             abort(403, 'Only an authorized admin can reserve booking materials.');
         }
 
-        if (!in_array($booking->status, ['downpayment_received', 'confirmed', 'in_preparation', 'event_in_progress'], true)) {
-            return redirect()->back()->with('error', 'Cannot reserve materials: booking must have verified payment / confirmed status.');
+        if (!$booking->hasVerifiedPayment() || !in_array($booking->status, ['downpayment_received', 'confirmed', 'fully_paid', 'in_preparation', 'event_in_progress'], true)) {
+            return redirect()->back()->with('error', 'Cannot reserve materials: a down payment or full payment must be verified first.');
         }
 
         if (is_null($booking->preparation_start_date)) {
             return redirect()->back()->with('error', 'Cannot reserve materials: please set a Preparation Start Date first.');
         }
 
-        if ($booking->preparation_start_date->isFuture()) {
-            return redirect()->back()->with('error', 'Cannot reserve materials: Preparation Start Date has not been reached yet.');
+        if (!$booking->hasValidPreparationSchedule()) {
+            return redirect()->back()->with('error', 'Cannot reserve materials: the preparation date must be at least 14 days before the event.');
         }
 
         try {
@@ -1487,9 +1503,7 @@ class BookingController extends Controller
                 return $res;
             });
 
-            $freshFlowerCount = $booking->bookingItems()
-                ->whereHas('inventoryItem', fn ($q) => $q->where('is_perishable', true))
-                ->count();
+            $freshFlowerCount = $booking->freshProcurementItems()->count();
 
             $msg = 'Reusable materials reserved successfully for preparation period.';
             if ($freshFlowerCount > 0) {
@@ -1564,13 +1578,14 @@ class BookingController extends Controller
 
     protected function validateBookingInventoryAvailability(Booking $booking, ?string $status): bool
     {
-        if (!in_array($status, ['downpayment_received', 'confirmed'], true)) {
+        if (!in_array($status, ['downpayment_received', 'confirmed', 'fully_paid'], true)) {
             return true;
         }
 
+        $reusableIds = $booking->reusableBookingItems()->pluck('inventory_item_id')->map(fn ($id) => (int) $id)->unique();
         foreach ($this->confirmedInventoryItems($booking) as $inventoryItem) {
             // Fresh flowers are perishable procurement requirements, not date-overlap locks
-            if ($inventoryItem->is_perishable) {
+            if (!$reusableIds->contains((int) $inventoryItem->id)) {
                 continue;
             }
 
@@ -1819,6 +1834,7 @@ class BookingController extends Controller
             'quantity' => ['nullable', 'numeric', 'min:0.01'],
             'unit_price' => ['nullable', 'numeric', 'min:0'],
             'unit_cost' => ['nullable', 'numeric', 'min:0'],
+            'confirm_distinct_catalog_item' => ['nullable', 'boolean'],
         ]);
 
         $bookingItem = $this->resolveAiSuggestedBookingItem($request, $booking, $bookingItem);
@@ -1834,7 +1850,10 @@ class BookingController extends Controller
             return redirect()->back()->with('error', 'That material is not part of this booking.');
         }
 
-        $existing = InventoryItem::catalogMatches((string) $request->input('catalog_name'))['exact'];
+        $existing = InventoryItem::catalogMatches(
+            (string) $request->input('catalog_name'),
+            unit: (string) $request->input('unit', 'piece')
+        )['exact'];
         if (($bookingItem || $suggestion) && $existing && !$existing->trashed()) {
             $bookingItem ??= $this->createLineFromAiSuggestion($request, $booking, $suggestion);
             // Already in the catalog: link this line to it instead of adding a duplicate item.
@@ -1848,7 +1867,10 @@ class BookingController extends Controller
             return redirect()->back()->with('success', "\"{$existing->name}\" is already in inventory, so this material was linked to it instead of adding a duplicate.");
         }
 
-        if ($duplicateError = $this->duplicateCatalogNameError((string) $request->input('catalog_name'))) {
+        if ($duplicateError = $this->duplicateCatalogNameError(
+            (string) $request->input('catalog_name'),
+            $request->boolean('confirm_distinct_catalog_item')
+        )) {
             return redirect()->back()->with('error', $duplicateError);
         }
 
@@ -1916,7 +1938,7 @@ class BookingController extends Controller
         }
 
         $bookingItem = $booking->bookingItems()->whereKey($bookingItem->id)->firstOrFail();
-        if ($bookingItem->confirmed_at) {
+        if ($bookingItem->confirmed_at && !$request->has('booking_item_ids')) {
             return redirect()->back()->with('success', 'Material requirement is already confirmed.');
         }
 
@@ -1924,20 +1946,60 @@ class BookingController extends Controller
             return redirect()->back()->with('error', 'Link or promote this AI suggestion before confirming it.');
         }
 
-        // The Qty and Unit Cost typed in this row are saved with the confirmation.
-        $validator = \Illuminate\Support\Facades\Validator::make($request->only(['quantity', 'unit_price']), $this->typedLineRules(''), $this->typedLineMessages());
+        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+            'booking_item_ids' => ['sometimes', 'array', 'min:1'],
+            'booking_item_ids.*' => ['required', 'integer', 'distinct'],
+        ] + $this->typedLineRules(''), $this->typedLineMessages());
         if ($validator->fails()) {
-            return redirect()->back()->with('error', $bookingItem->item_name . ': ' . $validator->errors()->first() . ' Nothing was saved.');
+            return redirect()->back()->with('error', $validator->errors()->first() . ' Nothing was saved.');
         }
         $typed = $validator->validated();
-        $typedLines = array_key_exists('quantity', $typed) || array_key_exists('unit_price', $typed)
-            ? [$bookingItem->id => $typed]
-            : [];
+        $lineIds = array_values(array_unique(array_map('intval', $typed['booking_item_ids'] ?? [$bookingItem->id])));
+        if (!in_array((int) $bookingItem->id, $lineIds, true)) {
+            return redirect()->back()->with('error', 'The grouped material selection is invalid. Nothing was saved.');
+        }
+
+        $lines = $booking->bookingItems()->whereIn('id', $lineIds)->orderBy('id')->get();
+        if ($lines->count() !== count($lineIds)
+            || $lines->contains(fn (BookingItem $line): bool => $line->confirmed_at !== null || !$line->inventory_item_id)
+            || $lines->pluck('inventory_item_id')->unique()->count() !== 1
+            || (int) $lines->first()->inventory_item_id !== (int) $bookingItem->inventory_item_id) {
+            return redirect()->back()->with('error', 'Only unconfirmed lines linked to the same inventory item can be confirmed together. Nothing was saved.');
+        }
+
+        $typedLines = [];
+        if (array_key_exists('quantity', $typed) || array_key_exists('unit_price', $typed)) {
+            $quantity = array_key_exists('quantity', $typed) ? (int) $typed['quantity'] : (int) $lines->sum('quantity');
+            $originalQuantity = (float) $lines->sum(fn (BookingItem $line) => (float) $line->quantity);
+            $originalAmount = (float) $lines->sum(fn (BookingItem $line) => (float) $line->quantity * (float) $line->quoted_unit_price);
+            $originalAveragePrice = $originalQuantity > 0 ? $originalAmount / $originalQuantity : null;
+            $newPrice = array_key_exists('unit_price', $typed) ? round((float) $typed['unit_price'], 2) : null;
+            $preserveSourcePrices = $newPrice !== null && $originalAveragePrice !== null
+                && round($newPrice, 2) === round($originalAveragePrice, 2);
+            $remainingQuantity = $quantity;
+
+            foreach ($lines->values() as $index => $line) {
+                $lineQuantity = $index === $lines->count() - 1
+                    ? $remainingQuantity
+                    : ($originalQuantity > 0
+                        ? (int) floor($quantity * ((float) $line->quantity / $originalQuantity))
+                        : (int) floor($quantity / $lines->count()));
+                $remainingQuantity -= $lineQuantity;
+                $typedLines[$line->id] = ['quantity' => $lineQuantity];
+                if ($newPrice !== null) {
+                    if (!$preserveSourcePrices) {
+                        $typedLines[$line->id]['unit_price'] = $newPrice;
+                    }
+                }
+            }
+        }
 
         try {
-            DB::transaction(function () use ($booking, $bookingItem, $typedLines): void {
-                $this->applyTypedLineValues($booking, collect([$bookingItem]), $typedLines);
-                $this->confirmBookingItemRequirement($booking, $bookingItem);
+            DB::transaction(function () use ($booking, $lines, $typedLines): void {
+                $this->applyTypedLineValues($booking, $lines, $typedLines);
+                foreach ($lines as $line) {
+                    $this->confirmBookingItemRequirement($booking, $line);
+                }
             });
         } catch (\RuntimeException $e) {
             return redirect()->back()->with('error', $e->getMessage());
@@ -1945,7 +2007,12 @@ class BookingController extends Controller
 
         $this->recordReviewFromMaterialAction($booking, 'material confirmation');
 
-        return redirect()->back()->with('success', 'Material requirement confirmed for this booking.');
+        $count = $lines->count();
+        $message = $count === 1
+            ? 'Material requirement confirmed for this booking.'
+            : $count . ' materials confirmed for this booking.';
+
+        return redirect()->back()->with('success', $message);
     }
 
     /**
@@ -2091,18 +2158,6 @@ class BookingController extends Controller
         $bookingItem->confirmed_at = now();
         $bookingItem->save();
 
-        $booking->inventoryItems()->syncWithoutDetaching([
-            $bookingItem->inventory_item_id => [
-                'quantity' => (float) $bookingItem->quantity,
-                'quoted_unit_price' => (float) $bookingItem->quoted_unit_price,
-                'is_ai_suggested' => (bool) $bookingItem->is_ai_suggested,
-                'procurement_status' => $bookingItem->procurement_status ?? 'pending',
-                'suggested_order_date' => $bookingItem->suggested_order_date,
-                'suggested_delivery_date' => $bookingItem->suggested_delivery_date,
-                'notes' => $bookingItem->notes,
-            ],
-        ]);
-
         $this->logAuditEvent(
             'booking',
             'material_confirmed',
@@ -2245,6 +2300,93 @@ class BookingController extends Controller
         return $price > 0 ? $price : null;
     }
 
+    /**
+     * Expand one consolidated quotation row back into its unchanged source booking lines.
+     * The displayed total quantity can be adjusted, so distribute it proportionally while
+     * applying the same quoted unit price and remove/substitution choice to every source line.
+     *
+     * @param  array<int, array<string, mixed>>  $items
+     * @return array<int, array<string, mixed>>
+     */
+    protected function expandGroupedQuotationRows(Booking $booking, array $items): array
+    {
+        $expanded = [];
+        $seenBookingItemIds = [];
+
+        foreach ($items as $item) {
+            $sourceIds = array_values(array_unique(array_map('intval', (array) ($item['source_booking_item_ids'] ?? []))));
+            if (count($sourceIds) < 2) {
+                $expanded[] = $item;
+                continue;
+            }
+
+            $representativeId = (int) ($item['booking_item_id'] ?? 0);
+            if (!in_array($representativeId, $sourceIds, true)) {
+                $this->refuseBookingUpdate('The submitted consolidated material row is invalid.');
+            }
+
+            if (array_intersect($seenBookingItemIds, $sourceIds)) {
+                $this->refuseBookingUpdate('A booking material was submitted more than once.');
+            }
+
+            $lines = $booking->bookingItems()
+                ->whereIn('id', $sourceIds)
+                ->orderBy('id')
+                ->get();
+
+            if ($lines->count() !== count($sourceIds)
+                || !$lines->first()?->inventory_item_id
+                || $lines->pluck('inventory_item_id')->unique()->count() !== 1
+                || $lines->pluck('is_ai_suggested')->unique()->count() !== 1
+                || $lines->map(fn (BookingItem $line): bool => $line->confirmed_at !== null)->unique()->count() !== 1
+                || $lines->map(fn (BookingItem $line): bool => $line->procurement_status === \App\Services\QuotationPricingService::REMOVED_FROM_QUOTATION)->unique()->count() !== 1) {
+                $this->refuseBookingUpdate('Only lines linked to the same inventory item with matching review and removal status can be consolidated.');
+            }
+
+            $submittedQuantity = $item['quantity'] ?? null;
+            if (!is_numeric($submittedQuantity) || (float) $submittedQuantity < 0) {
+                $this->refuseBookingUpdate('The consolidated material quantity is invalid.');
+            }
+
+            $originalQuantity = (float) $lines->sum(fn (BookingItem $line) => (float) $line->quantity);
+            $originalAmount = (float) $lines->sum(fn (BookingItem $line) => (float) $line->quantity * (float) $line->quoted_unit_price);
+            $originalAveragePrice = $originalQuantity > 0 ? $originalAmount / $originalQuantity : null;
+            $preserveSourcePrices = $originalAveragePrice !== null
+                && is_numeric($item['unit_price'] ?? null)
+                && round((float) $item['unit_price'], 2) === round($originalAveragePrice, 2);
+            $remainingQuantity = round((float) $submittedQuantity, 2);
+            $seenBookingItemIds = array_merge($seenBookingItemIds, $sourceIds);
+
+            foreach ($lines->values() as $index => $line) {
+                $isLast = $index === $lines->count() - 1;
+                $quantity = $isLast
+                    ? $remainingQuantity
+                    : round(
+                        $originalQuantity > 0
+                            ? (float) $submittedQuantity * ((float) $line->quantity / $originalQuantity)
+                            : (float) $submittedQuantity / $lines->count(),
+                        2
+                    );
+                $remainingQuantity = round($remainingQuantity - $quantity, 2);
+
+                $expandedItem = $item;
+                $expandedItem['booking_item_id'] = $line->id;
+                $expandedItem['quantity'] = $quantity;
+                $expandedItem['is_ai_suggested'] = (bool) $line->is_ai_suggested;
+                if ($preserveSourcePrices) {
+                    $expandedItem['unit_price'] = (float) $line->quoted_unit_price;
+                }
+                if ((int) ($item['inventory_item_id'] ?? 0) === (int) $line->inventory_item_id) {
+                    $expandedItem['item_name'] = $line->item_name;
+                }
+                unset($expandedItem['source_booking_item_ids']);
+                $expanded[] = $expandedItem;
+            }
+        }
+
+        return $expanded;
+    }
+
     protected function applyBookingUpdate(Request $request, Booking $booking): RedirectResponse
     {
         if ($request->filled('resolve_ai_item') || $request->filled('ai_item_name')) {
@@ -2302,7 +2444,7 @@ class BookingController extends Controller
             'event_type' => ['required', 'string', 'max:255'],
             'event_date' => ['required', 'date'],
             'venue' => ['required', 'string', 'max:500'],
-            'status' => ['required', 'string', 'in:pending,approved,rejected,event_in_progress,event_completed,pending_return,pending_resolution,completed,cancelled,quotation_sent,payment_submitted,payment_pending,confirmed,downpayment_received,declined,change_requested,cancellation_requested'],
+            'status' => ['required', 'string', 'in:pending,approved,rejected,event_in_progress,event_completed,pending_return,pending_resolution,completed,cancelled,quotation_sent,payment_submitted,payment_pending,confirmed,fully_paid,downpayment_received,declined,change_requested,cancellation_requested'],
             'special_requests' => ['nullable', 'string', 'max:2000'],
             'admin_note' => ['nullable', 'string', 'max:1000'],
             'admin_notes' => ['nullable', 'string', 'max:2000'],
@@ -2312,6 +2454,33 @@ class BookingController extends Controller
             'preparation_start_date' => ['nullable', 'date', 'before_or_equal:event_date'],
             'preparation_status' => ['nullable', 'string', 'in:scheduled,in_preparation,ready,completed'],
         ]);
+
+        $proposedEventDate = Carbon::parse($data['event_date'])->startOfDay();
+        $proposedPreparationDate = $request->exists('preparation_start_date')
+            ? (filled($request->input('preparation_start_date')) ? Carbon::parse($data['preparation_start_date'])->startOfDay() : null)
+            : $booking->preparation_start_date?->copy()->startOfDay();
+
+        if ($request->exists('preparation_start_date') && filled($request->input('preparation_start_date'))) {
+            if (!$booking->hasVerifiedPayment()) {
+                return redirect()->back()->withErrors([
+                    'preparation_start_date' => 'Preparation can only be scheduled after a down payment or full payment is verified.',
+                ])->withInput();
+            }
+
+            if (!$booking->isPreparationDateAllowed($proposedPreparationDate, $proposedEventDate)) {
+                return redirect()->back()->withErrors([
+                    'preparation_start_date' => 'Choose a date from today through at least 14 days before the event.',
+                ])->withInput();
+            }
+        } elseif ($proposedPreparationDate && !$booking->isPreparationDateAllowed($proposedPreparationDate, $proposedEventDate)) {
+            return redirect()->back()->withErrors([
+                'preparation_start_date' => 'The event date change makes the saved preparation date invalid. Choose a new preparation date at least 14 days before the event.',
+            ])->withInput();
+        }
+
+        if ($request->filled('preparation_status') && !$booking->hasVerifiedPayment()) {
+            return redirect()->back()->with('error', 'Operational preparation cannot start until a down payment or full payment is verified.');
+        }
 
         // Batch promotion adds catalog items: refuse a duplicate name before anything is written.
         if ($request->input('action') === 'promote_selected') {
@@ -2353,6 +2522,9 @@ class BookingController extends Controller
 
         if ($action === 'mark_event_in_progress' && !in_array($normalizedOldStatus, ['downpayment_received', 'confirmed', 'fully_paid', 'in_preparation'], true)) {
             return redirect()->back()->with('error', 'Only a confirmed booking with a verified payment can be marked as in progress.');
+        }
+        if ($action === 'mark_event_in_progress' && !$booking->hasVerifiedPayment()) {
+            return redirect()->back()->with('error', 'Only a booking with a verified down payment or full payment can be marked as in progress.');
         }
         if ($action === 'mark_event_completed' && $booking->isDelivery()) {
             return redirect()->back()->with('error', 'Delivery orders have no return audit. Use "Mark Item Received" once the client has the items.');
@@ -2420,6 +2592,9 @@ class BookingController extends Controller
 
         // Process item adjustments if provided without appending stale raw item lists to the custom client note.
         $items = $request->input('items', []);
+        if (is_array($items)) {
+            $items = $this->expandGroupedQuotationRows($booking, $items);
+        }
         $newRawMaterialsSum = 0;
         $latestAnalysis = $booking->aiAnalyses()->latest('analyzed_at')->first();
         $analysisMaterials = $latestAnalysis?->suggested_materials ?? [];
@@ -2427,8 +2602,6 @@ class BookingController extends Controller
         $substitutionAuditEntries = [];
 
         if (!empty($items) && is_array($items)) {
-            $itemsToKeep = [];
-
             foreach ($items as $it) {
                 $name = trim((string) ($it['item_name'] ?? $it['name'] ?? 'Item'));
                 $qty = isset($it['quantity']) ? (float) $it['quantity'] : (isset($it['adjusted_quantity']) ? (float) $it['adjusted_quantity'] : null);
@@ -2543,13 +2716,6 @@ class BookingController extends Controller
                             }
                         }
 
-                        if ($bookingItem->inventory_item_id && $bookingItem->confirmed_at) {
-                            $itemsToKeep[$bookingItem->inventory_item_id] = [
-                                'quantity' => (float) $bookingItem->quantity,
-                                'quoted_unit_price' => (float) $bookingItem->quoted_unit_price,
-                            ];
-                        }
-
                         continue;
                     }
                 }
@@ -2624,20 +2790,6 @@ class BookingController extends Controller
                     $bookingItem = null;
                 }
 
-                if ($bookingItem && $inventoryItem && $bookingItem->confirmed_at) {
-                    if ($qty !== null && $qty <= 0) {
-                        continue;
-                    }
-
-                    $updateData = [];
-                    if ($qty !== null) {
-                        $updateData['quantity'] = $qty;
-                    }
-                    if ($unitPrice !== null) {
-                        $updateData['quoted_unit_price'] = $unitPrice;
-                    }
-                    $itemsToKeep[$inventoryItem->id] = $updateData;
-                }
             }
 
             if ($latestAnalysis && $analysisModified) {
@@ -2680,25 +2832,9 @@ class BookingController extends Controller
                             ]);
                         }
 
-                        // Ensure pivot will contain this new inventory item
-                        $itemsToKeep[$inventoryItem->id] = [
-                            'quantity' => (float) ($bItem->quantity ?? ($it['quantity'] ?? 1)),
-                            'quoted_unit_price' => (float) ($bItem->quoted_unit_price ?? ($it['unit_price'] ?? 0)),
-                        ];
                     }
                 }
             }
-
-            $confirmedItemsToKeep = [];
-            foreach ($booking->bookingItems()->get() as $confirmedBookingItem) {
-                if ($confirmedBookingItem->inventory_item_id) {
-                    $confirmedItemsToKeep[$confirmedBookingItem->inventory_item_id] = [
-                        'quantity' => (float) $confirmedBookingItem->quantity,
-                        'quoted_unit_price' => (float) $confirmedBookingItem->quoted_unit_price,
-                    ];
-                }
-            }
-            $booking->inventoryItems()->syncWithoutDetaching($confirmedItemsToKeep);
 
             $newRawMaterialsSum = 0;
             $updatedPivots = $this->confirmedInventoryItems($booking);
@@ -2740,8 +2876,7 @@ class BookingController extends Controller
             $booking->setNormalizedStatus('quotation_sent');
             $notificationStatus = 'quotation_sent';
         } elseif ($action === 'mark_event_in_progress') {
-            $hasFreshFlowers = $this->confirmedInventoryItems($booking)->contains(fn ($i) => $i->is_perishable)
-                || $booking->bookingItems()->whereHas('inventoryItem', fn ($q) => $q->where('is_perishable', true))->exists();
+            $hasFreshFlowers = $booking->freshProcurementItems()->isNotEmpty();
 
             if ($hasFreshFlowers && !$booking->areFreshFlowersReady()) {
                 $booking->status = $oldStatus;
@@ -2755,8 +2890,9 @@ class BookingController extends Controller
                 return redirect()->back()->with('error', 'Cannot start the event because required reusable materials have not been dispatched.');
             }
 
+            $reusableIds = $booking->reusableBookingItems()->pluck('inventory_item_id')->map(fn ($id) => (int) $id)->unique();
             foreach ($this->confirmedInventoryItems($booking) as $inventoryItem) {
-                if ($inventoryItem->is_perishable) {
+                if (!$reusableIds->contains((int) $inventoryItem->id)) {
                     continue;
                 }
 
@@ -3061,13 +3197,9 @@ class BookingController extends Controller
         if ($notificationStatus && $booking->client && filter_var($booking->client->email, FILTER_VALIDATE_EMAIL)) {
             // Sent once the quotation transaction commits (immediately outside one), so a client is
             // never emailed about a quotation that was rolled back.
+            // Skipped when the status-change hook already emailed this status.
             DB::afterCommit(function () use ($booking, $notificationStatus): void {
-                try {
-                    Mail::to($booking->client->email)->send(new BookingStatusChanged($booking, null, $notificationStatus));
-                } catch (\Throwable $e) {
-                    // If mail fails, still keep the booking update.
-                    logger()->error('Booking status notification failed: ' . $e->getMessage());
-                }
+                \App\Services\ClientStatusNotifier::email($booking, $notificationStatus);
             });
         }
 
@@ -3131,10 +3263,19 @@ class BookingController extends Controller
                     $inventoryItems = collect();
                 }
 
-                // Only enforce immediate physical availability if preparation date is explicitly reached
-                $shouldReserveNow = !$isPostEvent && !is_null($booking->preparation_start_date) && !$booking->preparation_start_date->isFuture();
+                // A valid preparation schedule is a record of planned work; payment unlocks reservation.
+                $shouldReserveNow = !$isPostEvent
+                    && $booking->hasVerifiedPayment()
+                    && $booking->hasValidPreparationSchedule();
 
                 if ($shouldReserveNow) {
+                    $freshInventoryIds = $booking->bookingItems()
+                        ->with('inventoryItem')
+                        ->get()
+                        ->filter(fn (BookingItem $bookingItem) => $bookingItem->requiresFreshProcurement())
+                        ->pluck('inventory_item_id')
+                        ->map(fn ($id) => (int) $id)
+                        ->unique();
                     // Revalidate availability
                     foreach ($booking->inventoryItems as $item) {
                         $quantity = (float) ($item->pivot->quantity ?? 0);
@@ -3147,7 +3288,7 @@ class BookingController extends Controller
                             continue;
                         }
 
-                        if ($inventoryItem->is_perishable) {
+                        if ($freshInventoryIds->contains((int) $inventoryItem->id)) {
                             continue;
                         }
 
@@ -3301,8 +3442,9 @@ class BookingController extends Controller
 
     protected function hasRequiredDispatchOccurred(Booking $booking): bool
     {
+        $reusableIds = $booking->reusableBookingItems()->pluck('inventory_item_id')->map(fn ($id) => (int) $id)->unique();
         $confirmedHardware = $this->confirmedInventoryItems($booking)
-            ->filter(fn ($item) => !$item->is_perishable);
+            ->filter(fn ($item) => $reusableIds->contains((int) $item->id));
         
         if ($confirmedHardware->isEmpty()) {
             return true; // No reusable materials required for physical dispatch
@@ -3310,7 +3452,7 @@ class BookingController extends Controller
         
         $totalNetDispatch = \App\Models\InventoryTransaction::where('booking_id', $booking->id)
             ->whereIn('transaction_type', ['dispatch', 'dispatch_correction'])
-            ->whereHas('inventoryItem', fn ($q) => $q->where('is_perishable', false))
+            ->whereIn('inventory_item_id', $reusableIds)
             ->sum('quantity_change');
             
         // Dispatch quantity_change is negative, so we use absolute value.
@@ -3621,15 +3763,8 @@ class BookingController extends Controller
             ]);
         }
 
-        // notify client
-        try {
-            if ($booking->client && filter_var($booking->client->email, FILTER_VALIDATE_EMAIL)) {
-                Mail::to($booking->client->email)
-                    ->send(new BookingStatusChanged($booking, null, 'declined'));
-            }
-        } catch (\Throwable $e) {
-            // logger()->error('Mail send failed: '.$e->getMessage());
-        }
+        // notify client (skipped when the status-change hook already emailed it)
+        \App\Services\ClientStatusNotifier::email($booking, 'declined');
 
         return redirect()->route('admin.bookings')->with('success', 'Booking declined.');
     }
@@ -3737,9 +3872,15 @@ class BookingController extends Controller
             abort(403, 'Unauthorized. Admin authorization required.');
         }
 
-        $perishableItems = $booking->bookingItems()
-            ->whereHas('inventoryItem', fn ($q) => $q->where('is_perishable', true))
-            ->get();
+        if (!$booking->hasVerifiedPayment()) {
+            return back()->with('error', 'Fresh flower procurement cannot be confirmed until a down payment or full payment is verified.');
+        }
+
+        if (!$booking->hasValidPreparationSchedule()) {
+            return back()->with('error', 'Fresh flower procurement requires a valid preparation start date.');
+        }
+
+        $perishableItems = $booking->freshProcurementItems();
 
         if ($perishableItems->isEmpty()) {
             return back()->with('info', 'This booking has no perishable fresh flower items requiring procurement confirmation.');
@@ -3761,6 +3902,65 @@ class BookingController extends Controller
         });
 
         return back()->with('success', 'Fresh flower readiness has been explicitly confirmed for this event.');
+    }
+
+    public function updateFreshProcurementClassification(Request $request, Booking $booking, BookingItem $bookingItem): RedirectResponse
+    {
+        if (Auth::user()?->role !== 'admin') {
+            abort(403, 'Unauthorized. Admin authorization required.');
+        }
+
+        abort_unless((int) $bookingItem->booking_id === (int) $booking->id, 404);
+
+        $validated = $request->validate([
+            'fresh_procurement' => ['required', 'boolean'],
+        ]);
+
+        if (!$booking->hasVerifiedPayment()) {
+            return back()->with('error', 'Material classification can only be changed after a down payment or full payment is verified.');
+        }
+
+        if (!$booking->hasValidPreparationSchedule()) {
+            return back()->with('error', 'Material classification requires a valid preparation start date.');
+        }
+
+        $inventoryItemId = (int) $bookingItem->inventory_item_id;
+        if ($booking->bookingItems()->where('inventory_item_id', $inventoryItemId)->count() > 1) {
+            return back()->with('error', 'This inventory item appears more than once on the booking. Ask an Admin to resolve the duplicate before changing its procurement classification.');
+        }
+
+        if (InventoryTransaction::where('booking_id', $booking->id)->where('inventory_item_id', $inventoryItemId)->exists()) {
+            return back()->with('error', 'Procurement classification cannot be changed after inventory has been reserved or dispatched for this item.');
+        }
+
+        $freshProcurement = (bool) $validated['fresh_procurement'];
+        if ($bookingItem->requiresFreshProcurement() === $freshProcurement) {
+            return back()->with('info', 'This item already has the selected procurement classification.');
+        }
+
+        $previousClassification = $bookingItem->requiresFreshProcurement();
+        $bookingItem->fresh_procurement_override = $freshProcurement;
+        $bookingItem->procurement_status = 'pending';
+        $bookingItem->save();
+
+        $this->logAuditEvent(
+            'booking',
+            'fresh_procurement_classification_updated',
+            $booking,
+            sprintf(
+                'Booking item "%s" procurement classification changed from %s to %s.',
+                $bookingItem->item_name ?? $bookingItem->inventoryItem?->name ?? 'Unknown item',
+                $previousClassification ? 'fresh procurement' : 'reusable inventory',
+                $freshProcurement ? 'fresh procurement' : 'reusable inventory'
+            ),
+            Auth::id(),
+            ['booking_item_id' => $bookingItem->id, 'fresh_procurement' => $previousClassification],
+            ['booking_item_id' => $bookingItem->id, 'fresh_procurement' => $freshProcurement]
+        );
+
+        return back()->with('success', $freshProcurement
+            ? 'Item added to fresh-flower procurement for this booking.'
+            : 'Item removed from fresh-flower procurement for this booking. The booking item was retained as reusable inventory.');
     }
 
     /**
